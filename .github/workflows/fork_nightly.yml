@@ -20,7 +20,7 @@ permissions:
 
 concurrency:
   group: zed-custom-nightly
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   prepare:
