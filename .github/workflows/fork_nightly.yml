@@ -79,7 +79,7 @@ jobs:
           name: candidate-bundle
           path: ${{ runner.temp }}/candidate.bundle
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1
 
   macos:
     needs: prepare
@@ -135,7 +135,7 @@ jobs:
           name: macos-release
           path: release-assets/*
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1
 
   linux:
     needs: prepare
@@ -189,7 +189,7 @@ jobs:
           name: linux-release
           path: release-assets/*
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1
 
   publish:
     needs: [prepare, macos, linux]

@@ -20,6 +20,10 @@ GitHub disables scheduled Actions in new forks by default. Enable Actions and
 the workflow once after merging it to the default branch. The repository and
 its releases must remain public for installed applications to read release
 metadata and download assets without an embedded GitHub credential.
+The workflow uses standard GitHub-hosted runners. Its intermediate Actions
+artifacts expire after one day to limit storage usage; the published GitHub
+Release assets remain available. A full build on those runners still needs an
+end-to-end CI run to confirm their disk and memory are sufficient.
 
 ## First installation
 
