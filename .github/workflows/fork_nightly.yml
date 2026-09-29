@@ -7,6 +7,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/fork_nightly.yml
+      - crates/zed/src/main.rs
   workflow_dispatch:
     inputs:
       upstream_source:
