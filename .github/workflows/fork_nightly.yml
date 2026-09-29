@@ -3,7 +3,17 @@ name: Zed Custom nightly
 on:
   schedule:
     - cron: "31 5 * * *"
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fork_nightly.yml
   workflow_dispatch:
+    inputs:
+      upstream_source:
+        description: Upstream source for this release
+        type: choice
+        options: [nightly, main]
+        default: nightly
 
 permissions:
   contents: read
@@ -14,9 +24,11 @@ concurrency:
 
 jobs:
   prepare:
+    if: github.event_name != 'push' || contains(github.event.head_commit.message, '[bootstrap-release]')
     runs-on: ubuntu-22.04
     outputs:
       skip: ${{ steps.compose.outputs.skip }}
+      source_ref: ${{ steps.compose.outputs.source_ref }}
       upstream_sha: ${{ steps.compose.outputs.upstream_sha }}
       patch_sha: ${{ steps.compose.outputs.patch_sha }}
       build_sha: ${{ steps.compose.outputs.build_sha }}
@@ -25,22 +37,32 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Apply fork changes to upstream nightly
+      - name: Apply fork changes to upstream source
         id: compose
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ github.event_name == 'push' && 'main' || inputs.upstream_source || 'nightly' }}
         run: |
           set -euo pipefail
+          case "$SOURCE_REF" in
+            nightly|main) ;;
+            *) echo "Unsupported upstream source: $SOURCE_REF" >&2; exit 1 ;;
+          esac
           git remote add upstream https://github.com/zed-industries/zed.git
           git fetch --force upstream \
             '+refs/tags/nightly:refs/tags/upstream-nightly' \
             '+refs/heads/main:refs/remotes/upstream/main'
-          upstream_sha=$(git rev-parse 'refs/tags/upstream-nightly^{commit}')
+          if [[ "$SOURCE_REF" == main ]]; then
+            upstream_sha=$(git rev-parse refs/remotes/upstream/main)
+          else
+            upstream_sha=$(git rev-parse 'refs/tags/upstream-nightly^{commit}')
+          fi
           patch_sha=$(git rev-parse HEAD)
-          printf 'upstream_sha=%s\npatch_sha=%s\n' "$upstream_sha" "$patch_sha" >> "$GITHUB_OUTPUT"
+          printf 'source_ref=%s\nupstream_sha=%s\npatch_sha=%s\n' \
+            "$SOURCE_REF" "$upstream_sha" "$patch_sha" >> "$GITHUB_OUTPUT"
 
           latest_body=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .body 2>/dev/null || true)
-          if [[ "$latest_body" == *"Upstream nightly: $upstream_sha"* &&
+          if [[ "$latest_body" == *"Upstream $SOURCE_REF: $upstream_sha"* &&
                 "$latest_body" == *"Fork main: $patch_sha"* ]]; then
             echo 'skip=true' >> "$GITHUB_OUTPUT"
             exit 0
@@ -48,7 +70,7 @@ jobs:
 
           base=$(git merge-base HEAD refs/remotes/upstream/main)
           if ! git merge-base --is-ancestor "$base" "$upstream_sha"; then
-            echo "Upstream nightly has not reached fork base $base; waiting for the next nightly"
+            echo "Upstream $SOURCE_REF has not reached fork base $base; waiting for a newer source"
             echo 'skip=true' >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -56,7 +78,7 @@ jobs:
           git checkout --detach "$upstream_sha"
           if ! git apply --3way --index "$RUNNER_TEMP/fork.patch"; then
             git status --short
-            echo "Fork patch conflicts with upstream nightly $upstream_sha" >&2
+            echo "Fork patch conflicts with upstream $SOURCE_REF $upstream_sha" >&2
             exit 1
           fi
 
@@ -67,7 +89,7 @@ jobs:
           git config user.email 'zed-custom-release@users.noreply.github.com'
           patch_timestamp=$(git show -s --format=%cI "$patch_sha")
           GIT_AUTHOR_DATE="$patch_timestamp" GIT_COMMITTER_DATE="$patch_timestamp" \
-            git commit --allow-empty -m "Apply Zed Custom patches to upstream nightly"
+            git commit --allow-empty -m "Apply Zed Custom patches to upstream $SOURCE_REF"
           build_sha=$(git rev-parse HEAD)
           version=$(./script/get-crate-version zed)
           tag="v${version}+nightly.${GITHUB_RUN_NUMBER}.${build_sha}"
@@ -215,6 +237,7 @@ jobs:
       - name: Publish complete release
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
           UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
           PATCH_SHA: ${{ needs.prepare.outputs.patch_sha }}
           BUILD_SHA: ${{ needs.prepare.outputs.build_sha }}
@@ -233,9 +256,9 @@ jobs:
           fi
 
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
-          Zed Custom build from upstream nightly with the fork changes.
+          Zed Custom build from upstream $SOURCE_REF with the fork changes.
 
-          Upstream nightly: $UPSTREAM_SHA
+          Upstream $SOURCE_REF: $UPSTREAM_SHA
           Fork main: $PATCH_SHA
           Build commit: $BUILD_SHA
 

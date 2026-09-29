@@ -25,6 +25,12 @@ artifacts expire after one day to limit storage usage; the published GitHub
 Release assets remain available. A full build on those runners still needs an
 end-to-end CI run to confirm their disk and memory are sufficient.
 
+The manual workflow trigger can select upstream `main` for an initial release
+when the latest upstream `nightly` still predates the fork's base commit. A
+commit to this workflow on the fork's `main` with `[bootstrap-release]` in its
+message also starts that one-time `main` source build. Scheduled runs and
+ordinary manual runs continue to use upstream `nightly`.
+
 ## First installation
 
 Download `Zed-aarch64.dmg` or `zed-linux-x86_64.tar.gz` from the latest
