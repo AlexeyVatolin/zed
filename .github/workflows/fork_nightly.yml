@@ -1,0 +1,255 @@
+name: Zed Custom nightly
+
+on:
+  schedule:
+    - cron: "31 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zed-custom-nightly
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      skip: ${{ steps.compose.outputs.skip }}
+      upstream_sha: ${{ steps.compose.outputs.upstream_sha }}
+      patch_sha: ${{ steps.compose.outputs.patch_sha }}
+      build_sha: ${{ steps.compose.outputs.build_sha }}
+      tag: ${{ steps.compose.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply fork changes to upstream nightly
+        id: compose
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/zed-industries/zed.git
+          git fetch --force upstream \
+            '+refs/tags/nightly:refs/tags/upstream-nightly' \
+            '+refs/heads/main:refs/remotes/upstream/main'
+          upstream_sha=$(git rev-parse 'refs/tags/upstream-nightly^{commit}')
+          patch_sha=$(git rev-parse HEAD)
+          printf 'upstream_sha=%s\npatch_sha=%s\n' "$upstream_sha" "$patch_sha" >> "$GITHUB_OUTPUT"
+
+          latest_body=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .body 2>/dev/null || true)
+          if [[ "$latest_body" == *"Upstream nightly: $upstream_sha"* &&
+                "$latest_body" == *"Fork main: $patch_sha"* ]]; then
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base=$(git merge-base HEAD refs/remotes/upstream/main)
+          if ! git merge-base --is-ancestor "$base" "$upstream_sha"; then
+            echo "Upstream nightly has not reached fork base $base; waiting for the next nightly"
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --binary --full-index "$base" HEAD > "$RUNNER_TEMP/fork.patch"
+          git checkout --detach "$upstream_sha"
+          if ! git apply --3way --index "$RUNNER_TEMP/fork.patch"; then
+            git status --short
+            echo "Fork patch conflicts with upstream nightly $upstream_sha" >&2
+            exit 1
+          fi
+
+          printf 'nightly\n' > crates/zed/RELEASE_CHANNEL
+          git add crates/zed/RELEASE_CHANNEL
+
+          git config user.name 'Zed Custom release'
+          git config user.email 'zed-custom-release@users.noreply.github.com'
+          patch_timestamp=$(git show -s --format=%cI "$patch_sha")
+          GIT_AUTHOR_DATE="$patch_timestamp" GIT_COMMITTER_DATE="$patch_timestamp" \
+            git commit --allow-empty -m "Apply Zed Custom patches to upstream nightly"
+          build_sha=$(git rev-parse HEAD)
+          version=$(./script/get-crate-version zed)
+          tag="v${version}+nightly.${GITHUB_RUN_NUMBER}.${build_sha}"
+          printf 'skip=false\nbuild_sha=%s\ntag=%s\n' "$build_sha" "$tag" >> "$GITHUB_OUTPUT"
+          git bundle create "$RUNNER_TEMP/candidate.bundle" HEAD "^$upstream_sha"
+      - uses: actions/upload-artifact@v4
+        if: steps.compose.outputs.skip == 'false'
+        with:
+          name: candidate-bundle
+          path: ${{ runner.temp }}/candidate.bundle
+          if-no-files-found: error
+          retention-days: 3
+
+  macos:
+    needs: prepare
+    if: needs.prepare.outputs.skip == 'false'
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-bundle
+          path: ${{ runner.temp }}
+      - name: Check out candidate
+        env:
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          BUILD_SHA: ${{ needs.prepare.outputs.build_sha }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/zed-industries/zed.git
+          git fetch upstream "$UPSTREAM_SHA"
+          git fetch "$RUNNER_TEMP/candidate.bundle" HEAD
+          git checkout --detach "$BUILD_SHA"
+          test "$(cat crates/zed/RELEASE_CHANNEL)" = nightly
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Build macOS arm64
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: ./script/bundle-mac aarch64-apple-darwin
+      - name: Verify macOS archive
+        run: |
+          set -euo pipefail
+          dmg=target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+          mount="$RUNNER_TEMP/zed-custom-mount"
+          mkdir -p "$mount"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach "$mount"' EXIT
+          app="$mount/Zed Custom.app"
+          test -d "$app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = 'io.github.alexeyvatolin.ZedCustom'
+          codesign --verify --deep --strict "$app"
+          gzip -t target/zed-remote-server-macos-aarch64.gz
+      - name: Stage macOS assets
+        run: |
+          mkdir -p release-assets
+          cp target/aarch64-apple-darwin/release/Zed-aarch64.dmg release-assets/
+          cp target/zed-remote-server-macos-aarch64.gz release-assets/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 3
+
+  linux:
+    needs: prepare
+    if: needs.prepare.outputs.skip == 'false'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-bundle
+          path: ${{ runner.temp }}
+      - name: Check out candidate
+        env:
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          BUILD_SHA: ${{ needs.prepare.outputs.build_sha }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/zed-industries/zed.git
+          git fetch upstream "$UPSTREAM_SHA"
+          git fetch "$RUNNER_TEMP/candidate.bundle" HEAD
+          git checkout --detach "$BUILD_SHA"
+          test "$(cat crates/zed/RELEASE_CHANNEL)" = nightly
+      - name: Install build dependencies
+        run: |
+          ./script/linux
+          ./script/download-wasi-sdk
+      - name: Test updater
+        run: cargo test -p auto_update
+      - name: Build Linux x86_64
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: ./script/bundle-linux
+      - name: Verify Linux archive
+        run: |
+          set -euo pipefail
+          tar -tzf target/release/zed-linux-x86_64.tar.gz |
+            grep -qx 'zed-custom.app/libexec/zed-editor'
+          tar -tzf target/release/zed-linux-x86_64.tar.gz |
+            grep -qx 'zed-custom.app/share/applications/io.github.alexeyvatolin.ZedCustom.desktop'
+          gzip -t target/zed-remote-server-linux-x86_64.gz
+      - name: Stage Linux assets
+        run: |
+          mkdir -p release-assets
+          cp target/release/zed-linux-x86_64.tar.gz release-assets/
+          cp target/zed-remote-server-linux-x86_64.gz release-assets/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: [prepare, macos, linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-bundle
+          path: ${{ runner.temp }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-release
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-release
+          path: release-assets
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          PATCH_SHA: ${{ needs.prepare.outputs.patch_sha }}
+          BUILD_SHA: ${{ needs.prepare.outputs.build_sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/zed-industries/zed.git
+          git fetch upstream "$UPSTREAM_SHA"
+          git fetch "$RUNNER_TEMP/candidate.bundle" HEAD
+          git checkout --detach "$BUILD_SHA"
+          if git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
+            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$BUILD_SHA"
+          else
+            git tag "$RELEASE_TAG" "$BUILD_SHA"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Zed Custom build from upstream nightly with the fork changes.
+
+          Upstream nightly: $UPSTREAM_SHA
+          Fork main: $PATCH_SHA
+          Build commit: $BUILD_SHA
+
+          The macOS app uses an ad hoc signature and is not notarized. On first installation, macOS may require Open Anyway.
+          EOF
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --verify-tag --draft --title "Zed Custom $RELEASE_TAG" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+          release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .id)
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false -F prerelease=false -f make_latest=true >/dev/null
+          latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          test "$latest_tag" = "$RELEASE_TAG"
