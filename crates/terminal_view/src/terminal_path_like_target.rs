@@ -456,6 +456,36 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg(not(windows))]
+    async fn markdown_escaped_paths(cx: &mut TestAppContext) {
+        test_path_likes!(
+            cx,
+            vec![(
+                path!("/project"),
+                json!({
+                    "data": { "crawler_switch_eligible_results.md": "report" },
+                    "literal\\_name.md": "literal",
+                    "literal_name.md": "decoded",
+                })
+            )],
+            vec![path!("/project")],
+            {
+                test!(
+                    r"data/crawler\_switch\_eligible\_results.md",
+                    "/project/data/crawler_switch_eligible_results.md",
+                    None
+                );
+                test!(
+                    r"/project/data/crawler\_switch\_eligible\_results.md",
+                    "/project/data/crawler_switch_eligible_results.md",
+                    None
+                );
+                test!(r"literal\_name.md", r"/project/literal\_name.md", None);
+            }
+        );
+    }
+
+    #[gpui::test]
     async fn one_folder_worktree(cx: &mut TestAppContext) {
         test_path_likes!(
             cx,

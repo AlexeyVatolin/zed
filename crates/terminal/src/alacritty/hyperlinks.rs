@@ -720,6 +720,16 @@ mod tests {
         }
 
         #[test]
+        fn markdown_escaped_path() {
+            test_path!(
+                "Markdown-отчёт (‹«data/crawler\\_switch\\_👉eligible\\_results.md»›) обновляется каждые 10 хостов."
+            );
+            test_path!(
+                "Markdown-отчёт (‹«data/crawler👉\\_switch\\_eligible\\_results.md»›) обновляется."
+            );
+        }
+
+        #[test]
         fn simple() {
             // Rust paths
             // Just the path

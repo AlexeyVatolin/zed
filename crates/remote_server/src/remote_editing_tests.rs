@@ -5078,6 +5078,67 @@ async fn terminal_relative_links_resolve_unscanned_remote_files(
     assert_eq!(located.path().path, resolved.path().path);
     assert_eq!(located.path().row, Some(2));
     assert_eq!(located.path().column, Some(3));
+
+    #[cfg(not(windows))]
+    {
+        fs.insert_tree(
+            path!("/project/data"),
+            json!({ "crawler_switch_eligible_results.md": "report" }),
+        )
+        .await;
+        let metadata_calls = fs.metadata_call_count();
+        let escaped = visual_cx
+            .update(|_, cx| {
+                workspace::path_link::resolve_open_target(
+                    &workspace.downgrade(),
+                    workspace::path_link::PathMatching::Heuristic,
+                    r"data/crawler\_switch\_eligible\_results.md",
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            escaped.path().path,
+            Path::new(path!("/project/data/crawler_switch_eligible_results.md"))
+        );
+        assert_eq!(
+            fs.metadata_call_count(),
+            metadata_calls + 2,
+            "check the literal path before the decoded path"
+        );
+        let positioned = visual_cx
+            .update(|_, cx| {
+                workspace::path_link::resolve_open_target(
+                    &workspace.downgrade(),
+                    workspace::path_link::PathMatching::Heuristic,
+                    r"data/crawler\_switch\_eligible\_results.md:2:3",
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(positioned.path().path, escaped.path().path);
+        assert_eq!(positioned.path().row, Some(2));
+        assert_eq!(positioned.path().column, Some(3));
+        let exact = visual_cx
+            .update(|_, cx| {
+                workspace::path_link::resolve_open_target(
+                    &workspace.downgrade(),
+                    workspace::path_link::PathMatching::Exact,
+                    r"data/crawler\_switch\_eligible\_results.md",
+                    None,
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            exact.is_none(),
+            "document links must preserve their exact path"
+        );
+    }
 }
 
 #[gpui::test]
