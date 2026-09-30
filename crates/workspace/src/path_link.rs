@@ -328,6 +328,15 @@ fn resolve_open_target_internal(
         }
     });
 
+    // SSH terminals have no cwd. An exact worktree match already resolves the
+    // link, so don't spend a network round trip checking it again.
+    if background_path_checks == BackgroundPathChecks::ProjectPathResolution
+        && cwd.is_none()
+        && open_target.is_some()
+    {
+        return Task::ready(open_target);
+    }
+
     let background_resolution_task = match background_path_checks {
         BackgroundPathChecks::LocalFileSystem => {
             let fs_paths_to_check =
@@ -360,7 +369,13 @@ fn resolve_open_target_internal(
             })
         }
         BackgroundPathChecks::ProjectPathResolution => {
-            let paths_to_check = project_paths_to_check(&potential_paths, cwd);
+            let fallback_worktrees = if open_target.is_none() {
+                worktree_candidates.as_slice()
+            } else {
+                &[]
+            };
+            let paths_to_check =
+                project_paths_to_check(&potential_paths, cwd, fallback_worktrees, cx);
             cx.spawn(async move |cx| {
                 for mut path_to_check in paths_to_check {
                     let path = path_to_check.path.to_string_lossy();
@@ -522,6 +537,8 @@ fn local_paths_to_check(
 fn project_paths_to_check(
     potential_paths: &[PathWithPosition],
     cwd: Option<&Path>,
+    worktree_candidates: &[Entity<Worktree>],
+    cx: &App,
 ) -> Vec<PathWithPosition> {
     cwd.iter()
         .flat_map(|cwd| {
@@ -533,6 +550,19 @@ fn project_paths_to_check(
             let maybe_path = &path_to_check.path;
             (maybe_path.starts_with("~") || maybe_path.is_absolute()).then(|| path_to_check.clone())
         }))
+        .chain(worktree_candidates.iter().flat_map(|worktree| {
+            let worktree = worktree.read(cx);
+            let root = (!worktree.is_single_file()).then(|| worktree.abs_path());
+            potential_paths.iter().filter_map(move |path_to_check| {
+                if path_to_check.path.starts_with("~") {
+                    return None;
+                }
+                normalize_absolute_candidate(root.as_deref()?, path_to_check)
+            })
+        }))
+        // cwd, worktree roots and stripped prefixes can produce the same path.
+        // Keep their priority, but never repeat a metadata request for it.
+        .unique_by(|candidate| candidate.path.clone())
         .collect()
 }
 

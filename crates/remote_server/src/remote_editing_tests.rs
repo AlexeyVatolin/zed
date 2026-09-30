@@ -4890,6 +4890,102 @@ async fn test_remote_lsp_show_document(cx: &mut TestAppContext, server_cx: &mut 
 }
 
 #[gpui::test]
+async fn terminal_relative_links_resolve_unscanned_remote_files(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    cx.update(|cx| {
+        let settings = SettingsStore::test(cx);
+        cx.set_global(settings);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+    });
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/project"), json!({ "src": { "known.rs": "known" } }))
+        .await;
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/project"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    fs.pause_events();
+    fs.insert_tree(path!("/project/generated"), json!({ "later.rs": "new" }))
+        .await;
+    assert!(worktree.read_with(cx, |worktree, _| {
+        worktree
+            .entry_for_path(rel_path("generated/later.rs"))
+            .is_none()
+    }));
+
+    let visual_cx = cx.add_empty_window();
+    let workspace = visual_cx
+        .new_window_entity(|window, cx| workspace::Workspace::test_new(project, window, cx));
+    let metadata_calls = fs.metadata_call_count();
+    let cached = visual_cx
+        .update(|_, cx| {
+            workspace::path_link::resolve_open_target(
+                &workspace.downgrade(),
+                workspace::path_link::PathMatching::Heuristic,
+                "src/known.rs",
+                None,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        cached.path().path,
+        Path::new(path!("/project/src/known.rs"))
+    );
+    assert_eq!(
+        fs.metadata_call_count(),
+        metadata_calls,
+        "known paths must not send metadata requests"
+    );
+
+    let resolved = visual_cx
+        .update(|_, cx| {
+            workspace::path_link::resolve_open_target(
+                &workspace.downgrade(),
+                workspace::path_link::PathMatching::Heuristic,
+                "./generated/later.rs",
+                None,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.path().path,
+        Path::new(path!("/project/generated/later.rs"))
+    );
+    assert_eq!(
+        fs.metadata_call_count(),
+        metadata_calls + 1,
+        "normalized candidates must use only one metadata request"
+    );
+    let located = visual_cx
+        .update(|_, cx| {
+            workspace::path_link::resolve_open_target(
+                &workspace.downgrade(),
+                workspace::path_link::PathMatching::Heuristic,
+                "generated/later.rs:2:3",
+                None,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(located.path().path, resolved.path().path);
+    assert_eq!(located.path().row, Some(2));
+    assert_eq!(located.path().column, Some(3));
+}
+
+#[gpui::test]
 async fn arcadia_remote_request_returns_url_without_touching_server_clipboard(
     cx: &mut TestAppContext,
     server_cx: &mut TestAppContext,
