@@ -1,13 +1,10 @@
-name: Zed Custom nightly
+name: Zed Custom releases
 
 on:
   schedule:
     - cron: "31 5 * * *"
   push:
     branches: [main]
-    paths:
-      - .github/workflows/fork_nightly.yml
-      - crates/zed/src/main.rs
   workflow_dispatch:
     inputs:
       upstream_source:
@@ -25,7 +22,6 @@ concurrency:
 
 jobs:
   prepare:
-    if: github.event_name != 'push' || contains(github.event.head_commit.message, '[bootstrap-release]')
     runs-on: ubuntu-22.04
     outputs:
       skip: ${{ steps.compose.outputs.skip }}

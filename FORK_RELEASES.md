@@ -1,12 +1,14 @@
 # Zed Custom releases
 
-The fork's default branch contains the changes to apply to each upstream Zed
-nightly. The [Zed Custom nightly workflow](.github/workflows/fork_nightly.yml)
-runs daily and can also be started manually. It takes the current upstream
-`nightly` tag, applies the difference between the fork's `main` and its
-upstream base, then builds macOS arm64 and Linux x86_64. It publishes a GitHub
-Release only after both bundles pass their checks. The release includes the
-matching remote server binaries.
+The fork's default branch contains the changes to apply to upstream Zed.
+The [Zed Custom releases workflow](.github/workflows/fork_nightly.yml) runs
+after every push to the fork's `main`, including merges, and daily when the
+upstream `nightly` tag changes. Push runs use the current upstream `main`;
+scheduled runs use the current upstream `nightly`. The workflow applies the
+difference between the fork's `main` and its upstream base, then builds macOS
+arm64 and Linux x86_64. It publishes a GitHub Release only after both bundles
+pass their checks. The release includes the matching remote server binaries.
+The manual workflow trigger can select either upstream source.
 
 Keep custom changes on the fork's `main` branch once they are ready to ship.
 The workflow reads committed changes on GitHub; local uncommitted files are not
@@ -26,12 +28,6 @@ Release assets remain available. The first macOS and Linux bundles passed on
 those runners in the [initial build run](https://github.com/AlexeyVatolin/zed/actions/runs/36655244377);
 the [published release](https://github.com/AlexeyVatolin/zed/releases/latest)
 contains both client bundles and their remote servers.
-
-The manual workflow trigger can select upstream `main` for an initial release
-when the latest upstream `nightly` still predates the fork's base commit. A
-commit to this workflow on the fork's `main` with `[bootstrap-release]` in its
-message also starts that one-time `main` source build. Scheduled runs and
-ordinary manual runs continue to use upstream `nightly`.
 
 ## First installation
 
