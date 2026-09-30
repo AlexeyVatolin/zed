@@ -1,0 +1,67 @@
+name: Publish completed Zed Custom build
+
+on:
+  push:
+    branches: [publish-existing-36655244377]
+    paths:
+      - .github/workflows/publish_existing_release.yml
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: v1.23.0+nightly.6.50cae295a7967ce5b95bc0451951461fd5188d79
+      BUILD_SHA: 50cae295a7967ce5b95bc0451951461fd5188d79
+      UPSTREAM_SHA: decbf641b18f1982b3475c037e7c5c554471574f
+      PATCH_SHA: 4afbdea959f93f48e76d2f39760c5c72090aee4a
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-release
+          run-id: 36655244377
+          github-token: ${{ github.token }}
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-release
+          run-id: 36655244377
+          github-token: ${{ github.token }}
+          path: release-assets
+      - name: Verify existing build and publish
+        run: |
+          set -euo pipefail
+          tag_sha=$(git ls-remote --exit-code origin "refs/tags/$RELEASE_TAG" | cut -f1)
+          test "$tag_sha" = "$BUILD_SHA"
+          test -s release-assets/Zed-aarch64.dmg
+          test -s release-assets/zed-linux-x86_64.tar.gz
+          test -s release-assets/zed-remote-server-macos-aarch64.gz
+          test -s release-assets/zed-remote-server-linux-x86_64.gz
+
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Zed Custom build from upstream main with the fork changes.
+
+          Upstream main: $UPSTREAM_SHA
+          Fork main: $PATCH_SHA
+          Build commit: $BUILD_SHA
+
+          The macOS app uses an ad hoc signature and is not notarized. On first installation, macOS may require Open Anyway.
+          EOF
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --verify-tag --draft --title "Zed Custom $RELEASE_TAG" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+          release_id=$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq .id)
+          gh api -X PATCH "repos/$GH_REPO/releases/$release_id" \
+            -F draft=false -F prerelease=false -f make_latest=true >/dev/null
+          latest_tag=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
+          test "$latest_tag" = "$RELEASE_TAG"
