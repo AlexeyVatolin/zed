@@ -399,6 +399,209 @@ async fn test_absolute_paths(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_absolute_path_outside_project(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/root"), json!({ "known.rs": "known" }))
+        .await;
+    fs.insert_tree(
+        path!("/outside"),
+        json!({ "external.rs": "first\nsecond\nthird\nfourth" }),
+    )
+    .await;
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, workspace, cx) = build_find_picker(project.clone(), cx);
+
+    let metadata_calls = fs.metadata_call_count();
+    picker
+        .update_in(cx, |picker, window, cx| {
+            picker.delegate.update_matches("known".into(), window, cx)
+        })
+        .await;
+    assert_eq!(
+        fs.metadata_call_count(),
+        metadata_calls,
+        "ordinary search must not access the filesystem"
+    );
+
+    let external_path = PathBuf::from(path!("/outside/external.rs"));
+    picker
+        .update_in(cx, |picker, window, cx| {
+            picker
+                .delegate
+                .update_matches(format!("{}:2:3", external_path.display()), window, cx)
+        })
+        .await;
+    assert_eq!(
+        fs.metadata_call_count(),
+        metadata_calls + 1,
+        "absolute lookup needs only one metadata check"
+    );
+    picker.update(cx, |picker, cx| {
+        assert_matches!(picker.delegate.matches.matches.as_slice(), [Match::Absolute(path)] if *path == external_path);
+        assert_eq!(picker.delegate.selected_index, 0);
+        assert!(matches!(picker.delegate.try_get_preview_data_for_match(cx).unwrap().source, picker::PreviewSource::Message(_)));
+        assert_eq!(project.read(cx).worktrees(cx).count(), 1, "typing must not register an external file");
+    });
+    cx.dispatch_action(Confirm);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let editor = workspace.read(cx).active_item_as::<Editor>(cx).unwrap();
+        assert_eq!(editor.read(cx).title(cx), "external.rs");
+        editor.update(cx, |editor, cx| {
+            assert_eq!(
+                editor
+                    .selections
+                    .newest::<Point>(&editor.display_snapshot(cx))
+                    .head(),
+                Point::new(1, 2)
+            );
+        });
+        let worktree = project
+            .read(cx)
+            .find_worktree(&external_path, cx)
+            .unwrap()
+            .0;
+        assert!(worktree.read(cx).is_single_file());
+        assert!(!worktree.read(cx).is_visible());
+        assert_eq!(project.read(cx).visible_worktrees(cx).count(), 1);
+    });
+    let picker = open_file_picker(&workspace, cx);
+    picker
+        .update_in(cx, |picker, window, cx| {
+            picker
+                .delegate
+                .update_matches("external".into(), window, cx)
+        })
+        .await;
+    picker.update(cx, |picker, _| {
+        assert_match_at_position(picker, 0, "external.rs")
+    });
+}
+
+#[gpui::test]
+async fn test_absolute_paths_outside_project_in_splits(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(path!("/root"), json!({ "known.txt": "known" }))
+        .await;
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/outside"),
+            json!({ "first.txt": "first\nsecond\nthird", "second.txt": "second" }),
+        )
+        .await;
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, workspace, cx) = build_find_picker(project.clone(), cx);
+    picker
+        .update_in(cx, |picker, window, cx| {
+            picker
+                .delegate
+                .update_matches(path!("/outside/first.txt").into(), window, cx)
+        })
+        .await;
+    cx.dispatch_action(pane::SplitRight::default());
+    cx.run_until_parked();
+    cx.read(|cx| {
+        assert_eq!(
+            workspace
+                .read(cx)
+                .active_item_as::<Editor>(cx)
+                .unwrap()
+                .read(cx)
+                .title(cx),
+            "first.txt"
+        )
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.hide_modal(window, cx);
+    });
+    let picker = open_file_picker(&workspace, cx);
+
+    picker
+        .update_in(cx, |picker, window, cx| {
+            picker
+                .delegate
+                .update_matches(path!("/outside/second.txt").into(), window, cx)
+        })
+        .await;
+    picker.update_in(cx, |picker, window, cx| {
+        picker.delegate.toggle_item_selected(0, window, cx);
+    });
+    picker
+        .update_in(cx, |picker, window, cx| {
+            picker.delegate.update_matches("known".into(), window, cx)
+        })
+        .await;
+    picker.update_in(cx, |picker, window, cx| {
+        assert_match_at_position(picker, 1, "known.txt");
+        picker.delegate.toggle_item_selected(1, window, cx);
+        assert_eq!(picker.delegate.selected_matches.len(), 2);
+    });
+    cx.dispatch_action(pane::SplitRight::default());
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let pane = workspace.read(cx).active_pane().read(cx);
+        assert_eq!(pane.items_len(), 2);
+        assert_eq!(project.read(cx).visible_worktrees(cx).count(), 1);
+        let worktree = project
+            .read(cx)
+            .find_worktree(Path::new(path!("/outside/second.txt")), cx)
+            .unwrap()
+            .0;
+        assert!(worktree.read(cx).is_single_file());
+        assert!(!worktree.read(cx).is_visible());
+    });
+}
+
+#[gpui::test]
+async fn test_absolute_path_lookup_does_not_replace_newer_query(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(path!("/root"), json!({ "known.rs": "" }))
+        .await;
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(path!("/outside"), json!({ "external.rs": "" }))
+        .await;
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, _, cx) = build_find_picker(project, cx);
+    let stale_lookup = picker.update_in(cx, |picker, window, cx| {
+        picker.delegate.lookup_absolute_path(
+            test_path_position(path!("/outside/external.rs")),
+            picker.delegate.search_generation,
+            window,
+            cx,
+        )
+    });
+    picker
+        .update_in(cx, |picker, window, cx| {
+            picker.delegate.update_matches("known".into(), window, cx)
+        })
+        .await;
+    stale_lookup.await;
+    picker.update(cx, |picker, _| {
+        assert_eq!(
+            picker
+                .delegate
+                .latest_search_query
+                .as_ref()
+                .unwrap()
+                .path_query(),
+            "known"
+        );
+        assert_match_at_position(picker, 0, "known.rs");
+    });
+}
+
+#[gpui::test]
 async fn test_complex_path(cx: &mut TestAppContext) {
     let app_state = init_test(cx);
 
@@ -971,6 +1174,7 @@ async fn test_matching_cancellation(cx: &mut TestAppContext) {
                 ProjectPanelOrdMatch(matches[1].clone()),
                 ProjectPanelOrdMatch(matches[3].clone()),
             ],
+            None,
             cx,
         );
 
@@ -985,6 +1189,7 @@ async fn test_matching_cancellation(cx: &mut TestAppContext) {
                 ProjectPanelOrdMatch(matches[2].clone()),
                 ProjectPanelOrdMatch(matches[3].clone()),
             ],
+            None,
             cx,
         );
 
@@ -4712,6 +4917,7 @@ fn collect_search_matches(picker: &Picker<FileFinderDelegate>) -> SearchEntries 
             }
             Match::CreateNew(_) => {}
             Match::Channel { .. } => {}
+            Match::Absolute(_) => panic!("inspect absolute matches directly"),
         }
     }
     search_entries
@@ -4744,6 +4950,7 @@ fn assert_match_at_position(
         .unwrap_or_else(|| panic!("Finder has no match for index {match_index}"));
     let match_file_name = match &match_item {
         Match::History { path, .. } => path.absolute.file_name().and_then(|s| s.to_str()),
+        Match::Absolute(path) => path.file_name().and_then(|s| s.to_str()),
         Match::Search(path_match) => path_match.0.path.file_name(),
         Match::CreateNew(project_path) => project_path.path.file_name(),
         Match::Channel { channel_name, .. } => Some(channel_name.as_str()),

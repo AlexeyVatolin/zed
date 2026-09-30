@@ -203,10 +203,11 @@ impl ContentMode {
 }
 
 #[derive(Debug)]
-#[cfg_attr(test, derive(Clone, Eq, PartialEq))]
+#[cfg_attr(test, derive(Clone))]
 struct HoverTarget {
     tooltip: String,
     hovered_word: HoveredWord,
+    resolved_path: Option<(terminal::PathLikeTarget, workspace::path_link::OpenTarget)>,
 }
 
 impl EventEmitter<Event> for TerminalView {}
@@ -1254,6 +1255,7 @@ fn subscribe_for_terminal_events(
                                 terminal_view.hover = Some(HoverTarget {
                                     tooltip: url.clone(),
                                     hovered_word: hovered_word.clone(),
+                                    resolved_path: None,
                                 });
                                 terminal_view.hover_tooltip_update = Task::ready(());
                                 cx.notify();

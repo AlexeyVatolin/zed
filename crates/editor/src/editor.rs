@@ -12,6 +12,7 @@
 //!
 //! If you're looking to improve Vim mode, you should check out Vim crate that wraps Editor and overrides its behavior.
 pub mod actions;
+mod arcadia;
 pub mod blink_manager;
 mod bracket_colorization;
 mod clangd_ext;
