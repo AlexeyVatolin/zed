@@ -172,6 +172,73 @@ fn resolve_open_target_internal(
     cx: &App,
     background_path_checks: Option<BackgroundPathChecks>,
 ) -> Task<Option<OpenTarget>> {
+    let unescaped_path = if matching == PathMatching::Heuristic && maybe_path.contains('\\') {
+        workspace.upgrade().and_then(|workspace| {
+            let project = workspace.read(cx).project();
+            if project.read(cx).path_style(cx).is_posix() {
+                let unescaped = unescape_markdown_path(maybe_path);
+                (unescaped != maybe_path).then_some(unescaped)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    let literal_task = resolve_open_target_literal(
+        workspace,
+        matching,
+        maybe_path,
+        cwd,
+        cx,
+        background_path_checks,
+    );
+    let Some(unescaped_path) = unescaped_path else {
+        return literal_task;
+    };
+    let workspace = workspace.clone();
+    let cwd = cwd.map(Path::to_path_buf);
+    cx.spawn(async move |cx| {
+        // POSIX filenames may contain literal backslashes. Prefer those files,
+        // and decode Markdown escapes only when the literal path wasn't found.
+        if let Some(target) = literal_task.await {
+            return Some(target);
+        }
+        cx.update(|cx| {
+            resolve_open_target_literal(
+                &workspace,
+                matching,
+                &unescaped_path,
+                cwd.as_deref(),
+                cx,
+                background_path_checks,
+            )
+        })
+        .await
+    })
+}
+
+fn unescape_markdown_path(path: &str) -> String {
+    let mut result = String::with_capacity(path.len());
+    let mut chars = path.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && chars.peek().is_some_and(|next| next.is_ascii_punctuation()) {
+            result.push(chars.next().unwrap());
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+fn resolve_open_target_literal(
+    workspace: &WeakEntity<Workspace>,
+    matching: PathMatching,
+    maybe_path: &str,
+    cwd: Option<&Path>,
+    cx: &App,
+    background_path_checks: Option<BackgroundPathChecks>,
+) -> Task<Option<OpenTarget>> {
     let Some(workspace) = workspace.upgrade() else {
         return Task::ready(None);
     };
