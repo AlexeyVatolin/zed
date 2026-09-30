@@ -468,7 +468,16 @@ impl ProjectPicker {
                                         .as_mut()
                                         .and_then(|connections| connections.get_mut(index.0))
                                     {
-                                        server.projects.insert(RemoteProject { paths });
+                                        if !server
+                                            .projects
+                                            .iter()
+                                            .any(|project| project.paths == paths)
+                                        {
+                                            server.projects.insert(RemoteProject {
+                                                paths,
+                                                ..Default::default()
+                                            });
+                                        }
                                     };
                                 }
                                 ServerIndex::Wsl(index) => {
@@ -478,7 +487,16 @@ impl ProjectPicker {
                                         .as_mut()
                                         .and_then(|connections| connections.get_mut(index.0))
                                     {
-                                        server.projects.insert(RemoteProject { paths });
+                                        if !server
+                                            .projects
+                                            .iter()
+                                            .any(|project| project.paths == paths)
+                                        {
+                                            server.projects.insert(RemoteProject {
+                                                paths,
+                                                ..Default::default()
+                                            });
+                                        }
                                     };
                                 }
                             }
@@ -829,6 +847,9 @@ enum RemoteMatch {
     ViewServerOptions {
         server: usize,
     },
+    CreateArcWorkspace {
+        server: usize,
+    },
 }
 
 impl RemoteMatch {
@@ -930,6 +951,12 @@ impl RemoteServerPickerDelegate {
                     matches.push(RemoteMatch::OpenFolder {
                         server: server_index,
                     });
+                    if matches!(server, RemoteEntry::Project { connection: Connection::Ssh(connection), .. } if connection.arc_workspaces.as_ref().is_some_and(|config| !config.types.is_empty()))
+                    {
+                        matches.push(RemoteMatch::CreateArcWorkspace {
+                            server: server_index,
+                        });
+                    }
                     matches.push(RemoteMatch::ViewServerOptions {
                         server: server_index,
                     });
@@ -1228,6 +1255,26 @@ impl PickerDelegate for RemoteServerPickerDelegate {
                     }
                 }
             }
+            RemoteMatch::CreateArcWorkspace { server } => {
+                let Some(server_entry) = self.state.servers.get(*server) else {
+                    return;
+                };
+                let options: RemoteConnectionOptions =
+                    server_entry.connection().into_owned().into();
+                remote_server_projects
+                    .update(cx, |this, cx| {
+                        if let Some(workspace) = this.workspace.upgrade() {
+                            crate::open_arc_workspace_modal(
+                                &workspace,
+                                options,
+                                this.create_new_window,
+                                window,
+                                cx,
+                            );
+                        }
+                    })
+                    .log_err();
+            }
             RemoteMatch::ViewServerOptions { server } => {
                 let Some(RemoteEntry::Project {
                     connection, index, ..
@@ -1274,6 +1321,9 @@ impl PickerDelegate for RemoteServerPickerDelegate {
             RemoteMatch::OpenFolder { .. } => {
                 Some(self.render_action_item(ix, IconName::Plus, "Open Folder", selected))
             }
+            RemoteMatch::CreateArcWorkspace { .. } => {
+                Some(self.render_action_item(ix, IconName::Plus, "Create Arc Workspace…", selected))
+            }
             RemoteMatch::ViewServerOptions { .. } => Some(self.render_action_item(
                 ix,
                 IconName::Settings,
@@ -1319,14 +1369,21 @@ impl PickerDelegate for RemoteServerPickerDelegate {
                                     .icon_size(IconSize::Small)
                                     .shape(IconButtonShape::Square)
                                     .size(ButtonSize::Large)
-                                    .tooltip(Tooltip::text("Delete Remote Project"))
-                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                    .tooltip(Tooltip::text(
+                                        if remote_project.arc_workspace.is_some() {
+                                            "Delete Arc Workspace from Server"
+                                        } else {
+                                            "Delete Remote Project"
+                                        },
+                                    ))
+                                    .on_click(cx.listener(move |_, _, window, cx| {
                                         let remote_project = remote_project.clone();
                                         remote_server_projects
                                             .update(cx, |this, cx| {
                                                 this.delete_remote_project(
                                                     server_ix,
                                                     &remote_project,
+                                                    window,
                                                     cx,
                                                 );
                                             })
@@ -2060,8 +2117,39 @@ impl RemoteServerProjects {
         &mut self,
         server: ServerIndex,
         project: &RemoteProject,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(arc_workspace) = project.arc_workspace.clone() {
+            if let ServerIndex::Ssh(index) = server {
+                let connection = RemoteSettings::get_global(cx)
+                    .ssh_connections()
+                    .nth(index.0);
+                if let (Some(connection), Some(source)) = (connection, self.workspace.upgrade()) {
+                    let task = crate::delete_arc_workspace(
+                        &source,
+                        Connection::Ssh(connection).into(),
+                        arc_workspace,
+                        window,
+                        cx,
+                    );
+                    cx.spawn_in(window, async move |this, cx| match task.await {
+                        Ok(true) => {
+                            this.update_in(cx, |this, window, cx| {
+                                this.refresh_default_picker(window, cx)
+                            })
+                            .log_err();
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            source.update(cx, |source, cx| source.show_error(error, cx));
+                        }
+                    })
+                    .detach();
+                }
+            }
+            return;
+        }
         match server {
             ServerIndex::Ssh(server) => {
                 self.delete_ssh_project(server, project, cx);
@@ -2135,6 +2223,7 @@ impl RemoteServerProjects {
                     upload_binary_over_ssh: None,
                     port_forwards: connection_options.port_forwards,
                     connection_timeout: connection_options.connection_timeout,
+                    arc_workspaces: None,
                 })
         });
     }
@@ -3161,6 +3250,59 @@ mod create_host_tests {
     }
 
     #[gpui::test]
+    async fn arc_creation_action_is_scoped_to_configured_servers(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let fs: Arc<dyn Fs> = app_state.fs.clone();
+        let config = settings::ArcWorkspacesConfig {
+            mount_root: "~/arcadia-worktrees".into(),
+            types: std::collections::BTreeMap::from([("custom".into(), "custom/project".into())]),
+        };
+        let completion = cx.update(|cx| {
+            settings::update_settings_file_with_completion(fs.clone(), cx, move |settings, _| {
+                settings.remote.ssh_connections = Some(vec![
+                    SshConnection {
+                        host: "arc-host".into(),
+                        arc_workspaces: Some(config),
+                        ..Default::default()
+                    },
+                    SshConnection {
+                        host: "ordinary-host".into(),
+                        ..Default::default()
+                    },
+                ]);
+            })
+        });
+        completion
+            .await
+            .expect("settings completion")
+            .expect("save configuration");
+        cx.run_until_parked();
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let modal = workspace.update_in(cx, |_, window, cx| {
+            let weak = cx.weak_entity();
+            cx.new(|cx| RemoteServerProjects::new(false, fs, window, weak, cx))
+        });
+        cx.update(|_, cx| {
+            let picker = modal.read(cx).default_picker.read(cx);
+            let servers: Vec<_> = picker
+                .delegate
+                .matches
+                .iter()
+                .filter_map(|entry| {
+                    if let RemoteMatch::CreateArcWorkspace { server } = entry {
+                        Some(*server)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(servers, vec![0]);
+        });
+    }
+
+    #[gpui::test]
     async fn test_create_host_from_ssh_config_returns_new_connection_index(
         cx: &mut TestAppContext,
     ) {
@@ -3173,6 +3315,7 @@ mod create_host_tests {
                     host: "host-a.example".to_string(),
                     projects: BTreeSet::from_iter([RemoteProject {
                         paths: vec!["/path/to/project-a".to_string()],
+                        ..Default::default()
                     }]),
                     ..Default::default()
                 }]);

@@ -88,6 +88,18 @@ message GetFilePermalinkResponse {
   string permalink = 1;
 }
 
+message GetArcadiaLink {
+  uint64 project_id = 1;
+  ProjectPath path = 2;
+  uint32 start_row = 3;
+  uint32 end_row = 4;
+  bool current_branch = 5;
+}
+
+message GetArcadiaLinkResponse {
+  string url = 1;
+}
+
 message Branch {
   bool is_head = 1;
   string ref_name = 2;

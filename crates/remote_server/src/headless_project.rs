@@ -308,6 +308,7 @@ impl HeadlessProject {
         session.add_entity_request_handler(Self::handle_open_server_settings);
         session.add_entity_request_handler(Self::handle_get_directory_environment);
         session.add_entity_request_handler(Self::handle_get_terminal_shell);
+        session.add_request_handler(cx.weak_entity(), Self::handle_get_arcadia_link);
         session.add_entity_message_handler(Self::handle_toggle_lsp_logs);
         session.add_entity_request_handler(Self::handle_open_image_by_path);
         session.add_entity_request_handler(Self::handle_trust_worktrees);
@@ -1253,6 +1254,37 @@ impl HeadlessProject {
             entries,
             entry_info,
         })
+    }
+
+    async fn handle_get_arcadia_link(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GetArcadiaLink>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GetArcadiaLinkResponse> {
+        let request = envelope.payload;
+        let path = project::ProjectPath::from_proto(request.path.context("missing file path")?)
+            .context("invalid file path")?;
+        let (file, environment) = this.update(&mut cx, |this, cx| {
+            let worktree = this
+                .worktree_store
+                .read(cx)
+                .worktree_for_id(path.worktree_id, cx)
+                .context("file worktree is no longer open")?;
+            let file = worktree.read(cx).absolutize(&path.path);
+            let environment = this.environment.update(cx, |environment, cx| {
+                environment.worktree_environment(worktree, cx)
+            });
+            anyhow::Ok((file, environment))
+        })?;
+        let url = project::arcadia::resolve_arcadia_link(
+            &file,
+            request.start_row,
+            request.end_row,
+            request.current_branch,
+            environment.await,
+        )
+        .await?;
+        Ok(proto::GetArcadiaLinkResponse { url })
     }
 
     async fn handle_get_path_metadata(

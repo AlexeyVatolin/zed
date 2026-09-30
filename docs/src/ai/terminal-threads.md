@@ -38,19 +38,47 @@ You can open as many Terminal Threads as you like. Each gets its own entry in th
 
 ## Running a Command Automatically {#terminal-thread-init-command}
 
-If you always run the same CLI in Terminal Threads, set the `agent.terminal_init_command` setting to have Zed run a command automatically whenever Zed creates a Terminal Thread shell:
+Regular **Terminal** threads open a plain shell. To choose which agent starts in a new **Herdr Terminal Thread**, open the Settings Editor under **AI** and set **Herdr Default Agent**. The default is `codex`. Or add this to your `settings.json`:
 
 ```json [settings]
 {
   "agent": {
-    "terminal_init_command": "claude"
+    "terminal_herdr_default_agent": "claude"
   }
 }
 ```
 
-The command is sent to the shell as if you had typed it, so it is interpreted by your configured shell—including on Windows and in remote or WSL projects—and the terminal remains a regular interactive shell after the command exits. It runs when creating a new Terminal Thread and when recreating a saved Terminal Thread after reopening a project.
+Set `terminal_herdr_default_agent` to `""` to open a Herdr shell without starting an agent. This setting applies to new Herdr sessions. Reopening a saved thread attaches to its existing session without starting another agent.
 
-You can also configure this from the Settings UI under **AI**, via the "Terminal Thread Init Command" field.
+For a custom shell command, set `agent.terminal_init_command` in the Settings Editor under **AI**. A nonempty init command overrides the default agent for new Herdr threads. Regular Terminal threads still open a plain shell.
+
+## Persistent Herdr Sessions {#persistent-herdr-sessions}
+
+If [Herdr](https://herdr.dev/) is installed on the host that runs the terminal, choose **Herdr Terminal Thread** from the new thread menu, or press **⌘⌥N** on macOS. This action always creates a named Herdr session, regardless of which agent type you created last. **Terminal** in the same menu always creates a regular terminal.
+
+To make the default new thread action use Herdr when the last created agent type was a terminal, set:
+
+```json [settings]
+{
+  "agent": {
+    "terminal_herdr_enabled": true,
+    "terminal_herdr_session_name_regex": "/arcadia-worktrees/([^/]+)",
+    "terminal_herdr_default_agent": "codex"
+  }
+}
+```
+
+The first regex capture group from the current workspace path becomes the session name. Without a match, Zed uses the workspace directory name. If that name is in use, Zed appends `-1`, `-2`, and so on. Names are restricted to 64 ASCII bytes of letters, digits, dots, underscores, and hyphens; other characters become hyphens. Zed shortens a long base name to leave room for a numeric suffix.
+
+To start Herdr with its spaces and agents sidebar hidden, put `sidebar_start_collapsed = true` and `sidebar_collapsed_mode = "hidden"` under `[ui]` in the Herdr `config.toml` on the host running Herdr. Herdr remembers subsequent manual sidebar changes for each session.
+
+Zed launches the configured agent in the new Herdr pane once. When Zed closes, the Herdr server retains the process. Reopening the Terminal Thread reconnects to the same Herdr session and does not repeat the launch. The thread uses a Herdr icon. When a Herdr integration reports a native agent session reference, Zed stores the latest value as you switch conversations inside Codex or Claude. Install the Herdr integration for your agent if you also want Herdr to resume that conversation after a cold Herdr server restart.
+
+When the active agent reports a terminal title, the Terminal Thread shows that conversation title and updates it as you switch conversations. Until a title is available, it shows the Herdr session name. A title you set manually in Zed remains your override.
+
+For example, run `herdr integration install codex` or `herdr integration install claude` on the host where the agent runs. These integrations also let Herdr report the current native session ID when you switch conversations inside one terminal.
+
+Closing or archiving the Terminal Thread in Zed stops and deletes its Herdr session. Zed removes the thread after Herdr confirms deletion. If deletion fails, Zed keeps the thread so you can retry. Herdr must be available on remote hosts as well as local hosts when using remote projects.
 
 ## Terminal Thread Titles {#terminal-thread-titles}
 
