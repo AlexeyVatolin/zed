@@ -1375,6 +1375,13 @@
     //
     // Example: "terminal_init_command": "claude"
     "terminal_init_command": "",
+    // Use Herdr for default Terminal Threads when the last created agent was a terminal.
+    // Explicit Terminal and Herdr Terminal Thread menu actions always create their named type.
+    "terminal_herdr_enabled": false,
+    // First capture group (or full match) of the workspace path. An empty
+    // pattern uses the workspace directory name.
+    // Example: "/arcadia-worktrees/([^/]+)"
+    "terminal_herdr_session_name_regex": "",
     // How thinking blocks should be displayed by default in the agent panel.
     //
     // Default: auto
