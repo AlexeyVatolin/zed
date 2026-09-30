@@ -9,6 +9,10 @@ main() {
     platform="$(uname -s)"
     arch="$(uname -m)"
     channel="${ZED_CHANNEL:-stable}"
+    cli_name="zed"
+    if [ "$channel" = "nightly" ]; then
+        cli_name="zed-custom"
+    fi
     ZED_VERSION="${ZED_VERSION:-latest}"
     # Use TMPDIR if available (for environments with non-standard temp directories)
     if [ -n "${TMPDIR:-}" ] && [ -d "${TMPDIR}" ]; then
@@ -54,8 +58,8 @@ main() {
 
     "$platform" "$@"
 
-    if [ "$(command -v zed)" = "$HOME/.local/bin/zed" ]; then
-        echo "Zed has been installed. Run with 'zed'"
+    if [ "$(command -v "$cli_name" || true)" = "$HOME/.local/bin/$cli_name" ]; then
+        echo "Zed has been installed. Run with '$cli_name'"
     else
         echo "To run Zed from your terminal, you must add ~/.local/bin to your PATH"
         echo "Run:"
@@ -74,7 +78,7 @@ main() {
                 ;;
         esac
 
-        echo "To run Zed now, '~/.local/bin/zed'"
+        echo "To run Zed now, '~/.local/bin/$cli_name'"
     fi
 }
 
@@ -82,6 +86,10 @@ linux() {
     if [ -n "${ZED_BUNDLE_PATH:-}" ]; then
         cp "$ZED_BUNDLE_PATH" "$temp/zed-linux-$arch.tar.gz"
     else
+        if [ "$channel" = "nightly" ]; then
+            echo "Set ZED_BUNDLE_PATH to a Zed Custom release archive" >&2
+            exit 1
+        fi
         echo "Downloading Zed version: $ZED_VERSION"
         curl "https://cloud.zed.dev/releases/$channel/$ZED_VERSION/download?asset=zed&arch=$arch&os=linux&source=install.sh" > "$temp/zed-linux-$arch.tar.gz"
     fi
@@ -91,13 +99,18 @@ linux() {
         suffix="-$channel"
     fi
 
+    app_folder="zed$suffix.app"
+    if [ "$channel" = "nightly" ]; then
+        app_folder="zed-custom.app"
+    fi
+
     appid=""
     case "$channel" in
       stable)
         appid="dev.zed.Zed"
         ;;
       nightly)
-        appid="dev.zed.Zed-Nightly"
+        appid="io.github.alexeyvatolin.ZedCustom"
         ;;
       preview)
         appid="dev.zed.Zed-Preview"
@@ -112,11 +125,11 @@ linux() {
     esac
 
     # Unpack
-    rm -rf "$HOME/.local/zed$suffix.app"
-    mkdir -p "$HOME/.local/zed$suffix.app"
+    rm -rf "$HOME/.local/$app_folder"
+    mkdir -p "$HOME/.local/$app_folder"
     tar -xzf "$temp/zed-linux-$arch.tar.gz" -C "$HOME/.local/"
 
-    zed_editor="$HOME/.local/zed$suffix.app/libexec/zed-editor"
+    zed_editor="$HOME/.local/$app_folder/libexec/zed-editor"
     if [ -f "$zed_editor" ] && command -v ldd >/dev/null 2>&1; then
         missing="$(ldd "$zed_editor" 2>/dev/null | sed -n 's/^[[:space:]]*\(.*\) => not found$/\1/p')"
         if [ -n "$missing" ]; then
@@ -130,29 +143,37 @@ linux() {
     mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
 
     # Link the binary
-    if [ -f "$HOME/.local/zed$suffix.app/bin/zed" ]; then
-        ln -sf "$HOME/.local/zed$suffix.app/bin/zed" "$HOME/.local/bin/zed"
+    if [ -f "$HOME/.local/$app_folder/bin/zed" ]; then
+        ln -sf "$HOME/.local/$app_folder/bin/zed" "$HOME/.local/bin/$cli_name"
     else
         # support for versions before 0.139.x.
-        ln -sf "$HOME/.local/zed$suffix.app/bin/cli" "$HOME/.local/bin/zed"
+        ln -sf "$HOME/.local/$app_folder/bin/cli" "$HOME/.local/bin/$cli_name"
     fi
 
     # Copy .desktop file
     desktop_file_path="$HOME/.local/share/applications/${appid}.desktop"
-    src_dir="$HOME/.local/zed$suffix.app/share/applications"
+    src_dir="$HOME/.local/$app_folder/share/applications"
     if [ -f "$src_dir/${appid}.desktop" ]; then
         cp "$src_dir/${appid}.desktop" "${desktop_file_path}"
     else
         # Fallback for older tarballs
         cp "$src_dir/zed$suffix.desktop" "${desktop_file_path}"
     fi
-    sed -i "s|Icon=zed|Icon=$HOME/.local/zed$suffix.app/share/icons/hicolor/512x512/apps/zed.png|g" "${desktop_file_path}"
-    sed -i "s|Exec=zed|Exec=$HOME/.local/zed$suffix.app/bin/zed|g" "${desktop_file_path}"
+    sed -i "s|Icon=zed|Icon=$HOME/.local/$app_folder/share/icons/hicolor/512x512/apps/zed.png|g" "${desktop_file_path}"
+    sed -i "s|Exec=$cli_name|Exec=$HOME/.local/$app_folder/bin/zed|g" "${desktop_file_path}"
 }
 
 macos() {
+    if [ "$channel" = "nightly" ] && [ -z "${ZED_BUNDLE_PATH:-}" ]; then
+        echo "Set ZED_BUNDLE_PATH to a Zed Custom release DMG" >&2
+        exit 1
+    fi
     echo "Downloading Zed version: $ZED_VERSION"
-    curl "https://cloud.zed.dev/releases/$channel/$ZED_VERSION/download?asset=zed&os=macos&arch=$arch&source=install.sh" > "$temp/Zed-$arch.dmg"
+    if [ -n "${ZED_BUNDLE_PATH:-}" ]; then
+        cp "$ZED_BUNDLE_PATH" "$temp/Zed-$arch.dmg"
+    else
+        curl "https://cloud.zed.dev/releases/$channel/$ZED_VERSION/download?asset=zed&os=macos&arch=$arch&source=install.sh" > "$temp/Zed-$arch.dmg"
+    fi
     hdiutil attach -quiet "$temp/Zed-$arch.dmg" -mountpoint "$temp/mount"
     app="$(cd "$temp/mount/"; echo *.app)"
     echo "Installing $app"
@@ -165,7 +186,7 @@ macos() {
 
     mkdir -p "$HOME/.local/bin"
     # Link the binary
-    ln -sf "/Applications/$app/Contents/MacOS/cli" "$HOME/.local/bin/zed"
+    ln -sf "/Applications/$app/Contents/MacOS/cli" "$HOME/.local/bin/$cli_name"
 }
 
 main "$@"
