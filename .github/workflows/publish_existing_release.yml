@@ -60,8 +60,6 @@ jobs:
               --verify-tag --draft --title "Zed Custom $RELEASE_TAG" \
               --notes-file "$RUNNER_TEMP/release-notes.md"
           fi
-          release_id=$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq .id)
-          gh api -X PATCH "repos/$GH_REPO/releases/$release_id" \
-            -F draft=false -F prerelease=false -f make_latest=true >/dev/null
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest
           latest_tag=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
           test "$latest_tag" = "$RELEASE_TAG"
