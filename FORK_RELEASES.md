@@ -22,8 +22,10 @@ its releases must remain public for installed applications to read release
 metadata and download assets without an embedded GitHub credential.
 The workflow uses standard GitHub-hosted runners. Its intermediate Actions
 artifacts expire after one day to limit storage usage; the published GitHub
-Release assets remain available. A full build on those runners still needs an
-end-to-end CI run to confirm their disk and memory are sufficient.
+Release assets remain available. The first macOS and Linux bundles passed on
+those runners in the [initial build run](https://github.com/AlexeyVatolin/zed/actions/runs/36655244377);
+the [published release](https://github.com/AlexeyVatolin/zed/releases/latest)
+contains both client bundles and their remote servers.
 
 The manual workflow trigger can select upstream `main` for an initial release
 when the latest upstream `nightly` still predates the fork's base commit. A
