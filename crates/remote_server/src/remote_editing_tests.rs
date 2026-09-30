@@ -4890,6 +4890,155 @@ async fn test_remote_lsp_show_document(cx: &mut TestAppContext, server_cx: &mut 
 }
 
 #[gpui::test]
+async fn arcadia_remote_request_returns_url_without_touching_server_clipboard(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    cx.update(|cx| {
+        let settings = SettingsStore::test(cx);
+        cx.set_global(settings);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+        editor::init(cx);
+    });
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    let (opts, session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+    let server = server_cx.new(|_| ());
+    session.add_request_handler(
+        server.downgrade(),
+        |_, _: client::TypedEnvelope<proto::Ping>, _| async { Ok(proto::Ack {}) },
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    session.add_request_handler(
+        server.downgrade(),
+        move |_, request: client::TypedEnvelope<proto::GetArcadiaLink>, _| {
+            handler_calls.fetch_add(1, Ordering::Relaxed);
+            async move {
+                assert_eq!(request.payload.project_id, proto::REMOTE_SERVER_PROJECT_ID);
+                assert_eq!(request.payload.path.unwrap().path, "src/lib.rs");
+                assert_eq!((request.payload.start_row, request.payload.end_row), (2, 5));
+                let revision = if request.payload.current_branch {
+                    "users%2Ftest%2Ffeature"
+                } else {
+                    "trunk"
+                };
+                Ok(proto::GetArcadiaLinkResponse {
+                    url: format!("https://a.yandex-team.ru/arcadia/src/lib.rs?rev={revision}#L3-6"),
+                })
+            }
+        },
+    );
+    server_cx.update(|cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "server clipboard".to_owned(),
+        ))
+    });
+    drop(connect_guard);
+    let ssh = RemoteClient::connect_mock(opts, cx).await;
+    let project = build_project(ssh, cx);
+    for current_branch in [false, true] {
+        let url = project
+            .update(cx, |project, cx| {
+                project.get_arcadia_link(
+                    ProjectPath {
+                        worktree_id: worktree::WorktreeId::from_proto(1),
+                        path: rel_path("src/lib.rs").into(),
+                    },
+                    2,
+                    5,
+                    current_branch,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(url.ends_with("#L3-6"));
+        assert!(url.contains(if current_branch {
+            "rev=users%2Ftest%2Ffeature"
+        } else {
+            "rev=trunk"
+        }));
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    let worktree = project.update(cx, |project, cx| {
+        project.add_test_remote_worktree("/arcadia", cx)
+    });
+    let buffer = cx.new(|cx| {
+        let mut buffer = Buffer::local("one\ntwo\nthree\nfour\nfive\nsix\nseven\n", cx);
+        buffer.file_updated(
+            Arc::new(project::File {
+                worktree,
+                path: rel_path("src/lib.rs").into(),
+                disk_state: language::DiskState::New,
+                entry_id: None,
+                is_local: false,
+                is_private: false,
+            }),
+            cx,
+        );
+        buffer
+    });
+    let window = cx.add_window(|window, cx| Editor::for_buffer(buffer, Some(project), window, cx));
+    let editor = window.root(cx).unwrap();
+    let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+    editor.update_in(cx, |editor, window, cx| {
+        editor.change_selections(SelectionEffects::default(), window, cx, |s| {
+            s.select_ranges([Point::new(2, 0)..Point::new(6, 0)]);
+        });
+        editor.open_context_menu(&editor::actions::OpenContextMenu, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "opening the menu must not request an Arcadia link"
+    );
+    assert!(
+        cx.debug_bounds("MENU_ITEM-Copy Arcadia Link to Trunk")
+            .is_some()
+    );
+    assert!(
+        cx.debug_bounds("MENU_ITEM-Copy Arcadia Link to Current Branch")
+            .is_some()
+    );
+
+    for (action, revision) in [
+        (
+            Box::new(editor::actions::CopyArcadiaLinkToTrunk) as Box<dyn gpui::Action>,
+            "trunk",
+        ),
+        (
+            Box::new(editor::actions::CopyArcadiaLinkToCurrentBranch) as Box<dyn gpui::Action>,
+            "users%2Ftest%2Ffeature",
+        ),
+    ] {
+        editor.update_in(cx, |editor, window, cx| {
+            use gpui::Focusable as _;
+            window.focus(&editor.focus_handle(cx), cx);
+            window.dispatch_action(action, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(format!(
+                    "https://a.yandex-team.ru/arcadia/src/lib.rs?rev={revision}#L3-6"
+                ))
+            );
+        });
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+    server_cx.update(|cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("server clipboard".to_owned())
+        )
+    });
+}
+
+#[gpui::test]
 async fn test_remote_execute_lsp_command(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
