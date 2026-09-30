@@ -200,10 +200,9 @@ jobs:
       - name: Verify Linux archive
         run: |
           set -euo pipefail
-          tar -tzf target/release/zed-linux-x86_64.tar.gz |
-            grep -qx 'zed-custom.app/libexec/zed-editor'
-          tar -tzf target/release/zed-linux-x86_64.tar.gz |
-            grep -qx 'zed-custom.app/share/applications/io.github.alexeyvatolin.ZedCustom.desktop'
+          tar -tzf target/release/zed-linux-x86_64.tar.gz > "$RUNNER_TEMP/linux-archive-contents"
+          grep -qx 'zed-custom.app/libexec/zed-editor' "$RUNNER_TEMP/linux-archive-contents"
+          grep -qx 'zed-custom.app/share/applications/io.github.alexeyvatolin.ZedCustom.desktop' "$RUNNER_TEMP/linux-archive-contents"
           gzip -t target/zed-remote-server-linux-x86_64.gz
       - name: Stage Linux assets
         run: |
