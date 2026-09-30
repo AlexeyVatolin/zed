@@ -240,6 +240,7 @@ jobs:
       - name: Publish complete release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
           UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
           PATCH_SHA: ${{ needs.prepare.outputs.patch_sha }}
