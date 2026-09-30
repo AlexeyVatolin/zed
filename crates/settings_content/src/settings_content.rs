@@ -1395,6 +1395,8 @@ pub struct SshConnection {
     pub args: Vec<String>,
     #[serde(default)]
     pub projects: collections::BTreeSet<RemoteProject>,
+    /// Arc workspace types available on this SSH server.
+    pub arc_workspaces: Option<ArcWorkspacesConfig>,
     /// Name to use for this server in UI.
     pub nickname: Option<String>,
     // By default Zed will download the binary to the host directly.
@@ -1423,6 +1425,24 @@ pub struct WslConnection {
 )]
 pub struct RemoteProject {
     pub paths: Vec<String>,
+    /// Mount metadata for remote folders created by Zed's Arc workspace action.
+    pub arc_workspace: Option<ArcWorkspace>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
+pub struct ArcWorkspacesConfig {
+    /// Remote directory in which Arcadia is mounted. `~` refers to the remote user's home.
+    pub mount_root: String,
+    /// Maps workspace type names to paths relative to the Arcadia mount.
+    pub types: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, JsonSchema)]
+pub struct ArcWorkspace {
+    pub name: String,
+    pub workspace_type: String,
+    pub mount_path: String,
+    pub project_path: String,
 }
 
 #[with_fallible_options]
