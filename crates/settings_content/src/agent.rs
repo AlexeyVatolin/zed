@@ -359,14 +359,20 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_terminal_card: Option<bool>,
-    /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
+    /// Command to automatically run when Zed creates a Herdr Terminal Thread.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).
-    /// An empty string disables this behavior.
+    /// Ordinary Terminal Threads always open a plain shell. An empty string disables this behavior.
     ///
     /// Default: ""
     pub terminal_init_command: Option<String>,
-    /// Run each Terminal Thread in its own persistent Herdr session.
+    /// Agent executable to start in a new Herdr Terminal Thread unless a custom
+    /// terminal_init_command is set. An empty string opens a plain Herdr shell.
+    ///
+    /// Default: "codex"
+    pub terminal_herdr_default_agent: Option<String>,
+    /// Use a persistent Herdr session for the default new terminal action.
+    /// Explicit Terminal Thread actions always open a plain shell.
     /// Archiving the thread stops and deletes that session.
     ///
     /// Default: false

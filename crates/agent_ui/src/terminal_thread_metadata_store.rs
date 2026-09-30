@@ -757,6 +757,7 @@ mod tests {
                 value: "session-after-switch".to_owned(),
             }),
             current_title: Some("Investigate failing tests".to_owned()),
+            is_working: true,
             initial_command: Some("codex".to_owned()),
             initial_command_sent: true,
         });
