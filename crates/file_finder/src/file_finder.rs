@@ -291,22 +291,26 @@ impl FileFinder {
             if let Some(workspace) = delegate.workspace.upgrade()
                 && let Some(m) = delegate.matches.get(delegate.selected_index())
             {
-                let path = match m {
-                    Match::History { path, .. } => {
-                        let worktree_id = path.project.worktree_id;
-                        ProjectPath {
-                            worktree_id,
-                            path: Arc::clone(&path.project.path),
-                        }
-                    }
-                    Match::Search(m) => project_path_for_search_match(&delegate.project, &m.0, cx),
-                    Match::CreateNew(p) => p.clone(),
-                    Match::Channel { .. } => return,
+                let Some(path_task) = project_path_for_match(&delegate.project, m, cx) else {
+                    return;
                 };
-                let open_task = workspace.update(cx, move |workspace, cx| {
-                    workspace.split_path_preview(path, false, Some(split_direction), window, cx)
-                });
-                open_task.detach_and_log_err(cx);
+                cx.spawn_in(window, async move |_, cx| {
+                    let (worktree, path) = path_task.await?;
+                    let result = workspace
+                        .update_in(cx, |workspace, window, cx| {
+                            workspace.split_path_preview(
+                                path,
+                                false,
+                                Some(split_direction),
+                                window,
+                                cx,
+                            )
+                        })?
+                        .await;
+                    drop(worktree);
+                    result
+                })
+                .detach_and_log_err(cx);
             }
         })
     }
@@ -360,6 +364,7 @@ pub struct FileFinderDelegate {
     project: Entity<Project>,
     channel_store: Option<Entity<ChannelStore>>,
     search_count: usize,
+    search_generation: usize,
     latest_search_id: usize,
     latest_search_did_cancel: bool,
     latest_search_query: Option<FileSearchQuery>,
@@ -425,6 +430,7 @@ enum Match {
         panel_match: Option<ProjectPanelOrdMatch>,
     },
     Search(ProjectPanelOrdMatch),
+    Absolute(PathBuf),
     Channel {
         channel_id: ChannelId,
         channel_name: SharedString,
@@ -438,13 +444,14 @@ impl Match {
         match self {
             Match::History { path, .. } => Some(&path.project.path),
             Match::Search(panel_match) => Some(&panel_match.0.path),
-            Match::Channel { .. } | Match::CreateNew(_) => None,
+            Match::Absolute(_) | Match::Channel { .. } | Match::CreateNew(_) => None,
         }
     }
 
     fn abs_path(&self, project: &Entity<Project>, cx: &App) -> Option<PathBuf> {
         match self {
             Match::History { path, .. } => Some(path.absolute.clone()),
+            Match::Absolute(path) => Some(path.clone()),
             Match::Search(ProjectPanelOrdMatch(path_match)) => Some(
                 project
                     .read(cx)
@@ -460,7 +467,7 @@ impl Match {
         match self {
             Match::History { panel_match, .. } => panel_match.as_ref(),
             Match::Search(panel_match) => Some(panel_match),
-            Match::Channel { .. } | Match::CreateNew(_) => None,
+            Match::Absolute(_) | Match::Channel { .. } | Match::CreateNew(_) => None,
         }
     }
 }
@@ -472,7 +479,7 @@ struct SelectedMatch(pub Match);
 impl SelectedMatch {
     fn new(m: Match) -> Option<Self> {
         match m {
-            Match::History { .. } | Match::Search(_) => Some(Self(m)),
+            Match::History { .. } | Match::Search(_) | Match::Absolute(_) => Some(Self(m)),
             Match::Channel { .. } | Match::CreateNew(_) => None,
         }
     }
@@ -489,6 +496,9 @@ impl Eq for SelectedMatch {}
 impl PartialEq<Match> for SelectedMatch {
     fn eq(&self, other: &Match) -> bool {
         match (&self.0, other) {
+            (Match::Absolute(a), Match::Absolute(b)) => a == b,
+            (Match::Absolute(a), Match::History { path, .. })
+            | (Match::History { path, .. }, Match::Absolute(a)) => *a == path.absolute,
             (Match::History { path: a, .. }, Match::History { path: b, .. }) => {
                 a.project == b.project
             }
@@ -666,6 +676,7 @@ impl Matches {
         match m {
             Match::History { panel_match, .. } => panel_match.as_ref().map_or(0.0, |pm| pm.0.score),
             Match::Search(pm) => pm.0.score,
+            Match::Absolute(_) => 1.0,
             Match::Channel { string_match, .. } => string_match.score,
             Match::CreateNew(_) => 0.0,
         }
@@ -828,6 +839,30 @@ fn project_path_for_search_match(
     ProjectPath { worktree_id, path }
 }
 
+// Register external files only when an open action requires a ProjectPath.
+fn project_path_for_match(
+    project: &Entity<Project>,
+    m: &Match,
+    cx: &mut App,
+) -> Option<Task<anyhow::Result<(Option<Entity<project::Worktree>>, ProjectPath)>>> {
+    match m {
+        Match::Absolute(path) => {
+            let task = Workspace::project_path_for_path(project.clone(), path, false, cx);
+            Some(cx.spawn(async move |_| {
+                let (worktree, path) = task.await?;
+                Ok((Some(worktree), path))
+            }))
+        }
+        Match::History { path, .. } => Some(Task::ready(Ok((None, path.project.clone())))),
+        Match::Search(m) => Some(Task::ready(Ok((
+            None,
+            project_path_for_search_match(project, &m.0, cx),
+        )))),
+        Match::CreateNew(path) => Some(Task::ready(Ok((None, path.clone())))),
+        Match::Channel { .. } => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct FoundPath {
     project: ProjectPath,
@@ -975,6 +1010,7 @@ impl FileFinderDelegate {
             project,
             channel_store,
             search_count: 0,
+            search_generation: 0,
             latest_search_id: 0,
             latest_search_did_cancel: false,
             latest_search_query: None,
@@ -1088,7 +1124,7 @@ impl FileFinderDelegate {
                 .update(cx, |picker, cx| {
                     picker
                         .delegate
-                        .set_search_matches(search_id, did_cancel, query, matches, cx)
+                        .set_search_matches(search_id, did_cancel, query, matches, None, cx)
                 })
                 .log_err();
         })
@@ -1100,6 +1136,7 @@ impl FileFinderDelegate {
         did_cancel: bool,
         query: FileSearchQuery,
         matches: impl IntoIterator<Item = ProjectPanelOrdMatch>,
+        absolute_path: Option<PathBuf>,
         cx: &mut Context<Picker<Self>>,
     ) {
         if search_id >= self.latest_search_id {
@@ -1246,6 +1283,9 @@ impl FileFinderDelegate {
                 }
             }
 
+            if let Some(path) = absolute_path {
+                self.matches.matches = vec![Match::Absolute(path)];
+            }
             self.prepend_selected_matches();
 
             self.selected_index = if !self.selected_matches.is_empty() {
@@ -1326,6 +1366,15 @@ impl FileFinderDelegate {
                     }
                 }
                 Match::Search(path_match) => self.labels_for_path_match(&path_match.0, path_style),
+                Match::Absolute(path) => (
+                    path.file_name()
+                        .map_or(String::new(), |name| name.to_string_lossy().into_owned()),
+                    Vec::new(),
+                    path.parent().map_or(String::new(), |parent| {
+                        parent.to_string_lossy().into_owned() + path_style.primary_separator()
+                    }),
+                    Vec::new(),
+                ),
                 Match::Channel {
                     channel_name,
                     string_match,
@@ -1462,17 +1511,18 @@ impl FileFinderDelegate {
 
     /// Attempts to resolve an absolute file path and update the search matches if found.
     ///
-    /// If the query path resolves to an absolute file that exists in the project,
-    /// this method will find the corresponding worktree and relative path, create a
-    /// match for it, and update the picker's search results.
+    /// Files outside existing worktrees are shown without registering a worktree
+    /// until the user opens them.
     ///
     /// Returns `true` if the absolute path exists, otherwise returns `false`.
     fn lookup_absolute_path(
-        &self,
+        &mut self,
         query: FileSearchQuery,
+        generation: usize,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Task<bool> {
+        let search_id = util::post_inc(&mut self.search_count);
         cx.spawn_in(window, async move |picker, cx| {
             let Some(project) = picker
                 .read_with(cx, |picker, _| picker.delegate.project.clone())
@@ -1481,17 +1531,19 @@ impl FileFinderDelegate {
                 return false;
             };
 
-            let query_path = Path::new(query.path_query());
             let mut path_matches = Vec::new();
 
-            let abs_file_exists = project
+            let resolved_path = project
                 .update(cx, |this, cx| {
                     this.resolve_abs_file_path(query.path_query(), cx)
                 })
                 .await
-                .is_some();
+                .and_then(|path| path.into_abs_path())
+                .map(PathBuf::from);
+            let abs_file_exists = resolved_path.is_some();
+            let mut absolute_path = resolved_path;
 
-            if abs_file_exists {
+            if let Some(query_path) = absolute_path.as_ref() {
                 project.update(cx, |project, cx| {
                     if let Some((worktree, relative_path)) = project.find_worktree(query_path, cx) {
                         path_matches.push(ProjectPanelOrdMatch(PathMatch {
@@ -1505,13 +1557,24 @@ impl FileFinderDelegate {
                         }));
                     }
                 });
+                if !path_matches.is_empty() {
+                    absolute_path = None;
+                }
             }
 
             picker
                 .update_in(cx, |picker, _, cx| {
                     let picker_delegate = &mut picker.delegate;
-                    let search_id = util::post_inc(&mut picker_delegate.search_count);
-                    picker_delegate.set_search_matches(search_id, false, query, path_matches, cx);
+                    if picker_delegate.search_generation == generation {
+                        picker_delegate.set_search_matches(
+                            search_id,
+                            false,
+                            query,
+                            path_matches,
+                            absolute_path,
+                            cx,
+                        );
+                    }
 
                     anyhow::Ok(())
                 })
@@ -1669,6 +1732,22 @@ impl FileFinderDelegate {
                         project_path_for_search_match(workspace.project(), &path_match.0, cx);
                     split_or_open(workspace, project_path, window, cx)
                 }
+                Match::Absolute(path) => {
+                    if secondary {
+                        workspace.split_abs_path(path.clone(), false, window, cx)
+                    } else {
+                        workspace.open_abs_path(
+                            path.clone(),
+                            OpenOptions {
+                                visible: Some(OpenVisible::None),
+                                focus: Some(focus_item),
+                                ..Default::default()
+                            },
+                            window,
+                            cx,
+                        )
+                    }
+                }
                 Match::Channel { .. } => unreachable!("handled above"),
             }
         });
@@ -1729,39 +1808,50 @@ impl FileFinderDelegate {
             return;
         };
         let selected = std::mem::take(&mut self.selected_matches);
-        let paths: Vec<ProjectPath> = selected
+        let paths: Vec<_> = selected
             .iter()
-            .filter_map(|selected| match &selected.0 {
-                Match::History { path, .. } => Some(ProjectPath {
-                    worktree_id: path.project.worktree_id,
-                    path: Arc::clone(&path.project.path),
-                }),
-                Match::Search(m) => Some(project_path_for_search_match(&self.project, &m.0, cx)),
-                Match::Channel { .. } | Match::CreateNew(_) => None,
-            })
+            .filter_map(|selected| project_path_for_match(&self.project, &selected.0, cx))
             .collect();
         if paths.is_empty() {
             return;
         }
-        workspace.update(cx, |workspace, cx| {
-            let new_pane =
-                workspace.split_pane(workspace.active_pane().clone(), split_direction, window, cx);
-            let count = paths.len();
-            for (i, path) in paths.into_iter().enumerate() {
-                let focus_item = i + 1 == count;
-                workspace
-                    .open_path_preview(
-                        path,
-                        Some(new_pane.downgrade()),
-                        focus_item,
-                        false,
-                        true,
-                        window,
-                        cx,
-                    )
-                    .detach_and_log_err(cx);
+        cx.spawn_in(window, async move |_, cx| {
+            let paths = join_all(paths)
+                .await
+                .into_iter()
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let open_tasks = workspace.update_in(cx, |workspace, window, cx| {
+                let new_pane = workspace.split_pane(
+                    workspace.active_pane().clone(),
+                    split_direction,
+                    window,
+                    cx,
+                );
+                let count = paths.len();
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, path))| {
+                        let focus_item = i + 1 == count;
+                        workspace.open_path_preview(
+                            path.clone(),
+                            Some(new_pane.downgrade()),
+                            focus_item,
+                            false,
+                            true,
+                            window,
+                            cx,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })?;
+            for result in join_all(open_tasks).await {
+                result.log_err();
             }
-        });
+            drop(paths);
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
         // Deferred because this runs from a `FileFinder` action handler, so
         // the entity is already being updated.
         let finder = self.file_finder.clone();
@@ -1871,6 +1961,8 @@ impl PickerDelegate for FileFinderDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
+        self.search_generation += 1;
+        let generation = self.search_generation;
         let debounce_refresh = mem::take(&mut self.debounce_next_refresh);
         let raw_query = raw_query.trim();
 
@@ -1953,12 +2045,21 @@ impl PickerDelegate for FileFinderDelegate {
                     cx.background_executor().timer(SEARCH_DEBOUNCE).await;
                 }
                 let _ = maybe!(async move {
+                    if this.read_with(cx, |picker, _| picker.delegate.search_generation)?
+                        != generation
+                    {
+                        return anyhow::Ok(());
+                    }
                     let is_absolute_path = path.is_absolute();
                     let did_resolve_abs_path = is_absolute_path
                         && this
                             .update_in(cx, |this, window, cx| {
-                                this.delegate
-                                    .lookup_absolute_path(query.clone(), window, cx)
+                                this.delegate.lookup_absolute_path(
+                                    query.clone(),
+                                    generation,
+                                    window,
+                                    cx,
+                                )
                             })?
                             .await;
 
@@ -1966,7 +2067,11 @@ impl PickerDelegate for FileFinderDelegate {
                     // found.
                     if !did_resolve_abs_path {
                         this.update_in(cx, |this, window, cx| {
-                            this.delegate.spawn_search(query, window, cx)
+                            if this.delegate.search_generation == generation {
+                                this.delegate.spawn_search(query, window, cx)
+                            } else {
+                                Task::ready(())
+                            }
                         })?
                         .await;
                     }
@@ -2054,6 +2159,12 @@ impl PickerDelegate for FileFinderDelegate {
     fn try_get_preview_data_for_match(&self, cx: &App) -> Option<picker::PreviewUpdate> {
         let m = self.matches.get(self.selected_index)?;
         match m {
+            // Loading a preview would register the external file before confirmation.
+            Match::Absolute(_) => {
+                let mut message = picker::HighlightedTextBuilder::default();
+                message.push_plain("Press Enter to open this file.");
+                Some(picker::PreviewUpdate::message(message.build()))
+            }
             Match::CreateNew(project_path) => {
                 let path_style = self.project.read(cx).path_style(cx);
                 let path_highlight = gpui::HighlightStyle {
@@ -2173,7 +2284,7 @@ impl FileFinderDelegate {
                     .size(IconSize::Small)
                     .into_any_element(),
             ),
-            Match::Search(_) | Match::Channel { .. } => Some(
+            Match::Search(_) | Match::Absolute(_) | Match::Channel { .. } => Some(
                 div()
                     .flex_none()
                     .size(IconSize::Small.rems())

@@ -4890,6 +4890,101 @@ async fn test_remote_lsp_show_document(cx: &mut TestAppContext, server_cx: &mut 
 }
 
 #[gpui::test]
+async fn file_finder_opens_remote_absolute_path_outside_project(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    cx.update(|cx| {
+        let settings = SettingsStore::test(cx);
+        cx.set_global(settings);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+        file_finder::init(cx);
+    });
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/project"), json!({ "known.txt": "known" }))
+        .await;
+    fs.insert_tree(
+        path!("/outside"),
+        json!({ "external.txt": "first\nsecond\nthird" }),
+    )
+    .await;
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/project"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    let window = cx
+        .add_window(|window, cx| workspace::MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let mut visual_cx = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual_cx.dispatch_action(workspace::ToggleFileFinder {
+        separate_history: true,
+        include_ignored: None,
+    });
+    visual_cx.run_until_parked();
+    visual_cx.read(|cx| {
+        assert!(
+            workspace
+                .read(cx)
+                .active_modal::<file_finder::FileFinder>(cx)
+                .is_some()
+        )
+    });
+    let metadata_calls = fs.metadata_call_count();
+    visual_cx.simulate_input(&format!("{}:2:3", path!("/outside/external.txt")));
+    visual_cx
+        .executor()
+        .advance_clock(std::time::Duration::from_millis(300));
+    visual_cx.run_until_parked();
+    assert_eq!(
+        fs.metadata_call_count(),
+        metadata_calls + 1,
+        "external lookup must use one server metadata request"
+    );
+    visual_cx.read(|cx| {
+        assert_eq!(
+            project.read(cx).worktrees(cx).count(),
+            1,
+            "querying must not register a worktree"
+        );
+    });
+    visual_cx.dispatch_action(menu::Confirm);
+    visual_cx.run_until_parked();
+    visual_cx.update(|_, cx| {
+        let editor = workspace
+            .read(cx)
+            .active_item_as::<Editor>(cx)
+            .expect("external file opened");
+        assert_eq!(editor.read(cx).text(cx), "first\nsecond\nthird");
+        editor.update(cx, |editor, cx| {
+            assert_eq!(
+                editor
+                    .selections
+                    .newest::<Point>(&editor.display_snapshot(cx))
+                    .head(),
+                Point::new(1, 2)
+            );
+        });
+        let worktree = project
+            .read(cx)
+            .find_worktree(Path::new(path!("/outside/external.txt")), cx)
+            .unwrap()
+            .0;
+        assert!(worktree.read(cx).is_single_file());
+        assert!(!worktree.read(cx).is_visible());
+        assert_eq!(project.read(cx).visible_worktrees(cx).count(), 1);
+    });
+    server_cx.run_until_parked();
+}
+
+#[gpui::test]
 async fn terminal_relative_links_resolve_unscanned_remote_files(
     cx: &mut TestAppContext,
     server_cx: &mut TestAppContext,
