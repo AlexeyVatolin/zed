@@ -2,6 +2,7 @@ use std::{collections::HashSet, path::Path, process::Command};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use collections::HashMap;
+use gpui::{Entity, Task};
 use project::Project;
 use regex::Regex;
 use remote::Interactive;
@@ -18,6 +19,8 @@ pub struct HerdrTerminalSession {
     pub agent_session: Option<HerdrAgentSession>,
     #[serde(default)]
     pub current_title: Option<String>,
+    #[serde(default)]
+    pub is_working: bool,
     #[serde(default)]
     pub initial_command: Option<String>,
     #[serde(default)]
@@ -39,15 +42,7 @@ impl HerdrTerminalSession {
     }
 
     pub fn icon(&self) -> IconName {
-        match self.agent.as_deref() {
-            Some("claude") => IconName::AiClaude,
-            Some("codex") => IconName::AiOpenAi,
-            Some("gemini") => IconName::AiGemini,
-            Some("opencode") => IconName::AiOpenCode,
-            Some("copilot") => IconName::Copilot,
-            Some("grok") => IconName::AiXAi,
-            _ => IconName::Terminal,
-        }
+        IconName::Herdr
     }
 
     pub fn display_title(&self) -> &str {
@@ -76,6 +71,9 @@ impl HerdrTerminalSession {
         let Some(pane) = pane else {
             return false;
         };
+        let is_working = panes
+            .iter()
+            .any(|pane| pane.get("agent_status").and_then(Value::as_str) == Some("working"));
         let agent_session = pane
             .get("agent_session")
             .and_then(|session| serde_json::from_value(session.clone()).ok());
@@ -119,12 +117,14 @@ impl HerdrTerminalSession {
         if self.agent == agent
             && self.agent_session == agent_session
             && self.current_title == current_title
+            && self.is_working == is_working
         {
             return false;
         }
         self.agent = agent;
         self.agent_session = agent_session;
         self.current_title = current_title;
+        self.is_working = is_working;
         true
     }
 
@@ -197,31 +197,56 @@ pub fn available_name(base: &str, occupied: &HashSet<String>) -> String {
 }
 
 pub fn command(
-    project: &Project,
+    project: Entity<Project>,
     args: &[String],
     session: Option<&str>,
-    cx: &App,
-) -> Result<Command> {
+    cx: &mut App,
+) -> Task<Result<Command>> {
     let mut environment = HashMap::default();
     if let Some(session) = session {
         environment.insert("HERDR_SESSION".to_owned(), session.to_owned());
     }
-    if let Some(remote_client) = project.remote_client() {
-        let template = remote_client.read(cx).build_command(
-            Some("herdr".to_owned()),
-            args,
-            &environment,
-            None,
-            None,
-            Interactive::No,
-        )?;
-        let mut command = Command::new(template.program);
-        command.args(template.args).envs(template.env);
-        Ok(command)
+    let (remote_client, directory, project_environment) = {
+        let project = project.read(cx);
+        (
+            project.remote_client(),
+            project.active_project_directory(cx),
+            project.environment().clone(),
+        )
+    };
+    if let Some(remote_client) = remote_client {
+        let Some(directory) = directory else {
+            return Task::ready(Err(anyhow!("No remote project directory for Herdr")));
+        };
+        // SSH's noninteractive PATH can omit user-installed binaries. Use the
+        // same cached login-shell environment as the project's terminals.
+        let shell_environment = project_environment.update(cx, |environment, cx| {
+            environment.directory_environment(directory, cx)
+        });
+        let args = args.to_vec();
+        cx.spawn(async move |cx| {
+            let mut shell_environment = shell_environment
+                .await
+                .context("Could not load the remote shell environment for Herdr")?;
+            shell_environment.extend(environment);
+            let template = remote_client.read_with(cx, |client, _| {
+                client.build_command(
+                    Some("herdr".to_owned()),
+                    &args,
+                    &shell_environment,
+                    None,
+                    None,
+                    Interactive::No,
+                )
+            })?;
+            let mut command = Command::new(template.program);
+            command.args(template.args).envs(template.env);
+            Ok(command)
+        })
     } else {
         let mut command = Command::new("herdr");
         command.args(args).envs(environment);
-        Ok(command)
+        Task::ready(Ok(command))
     }
 }
 
@@ -285,6 +310,7 @@ mod tests {
             agent: None,
             agent_session: None,
             current_title: None,
+            is_working: false,
             initial_command: None,
             initial_command_sent: false,
         };
@@ -308,7 +334,7 @@ mod tests {
         );
         let claude = serde_json::json!({"result": {"snapshot": {"focused_pane_id": "w1:p1", "panes": [{"pane_id": "w1:p1", "agent": "claude", "agent_session": {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": "second"}}]}}});
         assert!(session.update_from_snapshot(&claude));
-        assert_eq!(session.icon(), IconName::AiClaude);
+        assert_eq!(session.icon(), IconName::Herdr);
         assert_eq!(
             session
                 .agent_session
@@ -319,12 +345,41 @@ mod tests {
     }
 
     #[test]
+    fn pane_status_tracks_work_across_the_session() {
+        let mut session = HerdrTerminalSession {
+            name: "project".to_owned(),
+            agent: None,
+            agent_session: None,
+            current_title: None,
+            is_working: false,
+            initial_command: None,
+            initial_command_sent: false,
+        };
+        let snapshot = |status: &str| {
+            serde_json::json!({"result": {"snapshot": {
+                "focused_pane_id": "w1:p1",
+                "panes": [
+                    {"pane_id": "w1:p1", "agent_status": "idle"},
+                    {"pane_id": "w1:p2", "agent": "codex", "agent_status": status}
+                ]
+            }}})
+        };
+
+        assert!(session.update_from_snapshot(&snapshot("working")));
+        assert!(session.is_working);
+        assert!(!session.update_from_snapshot(&snapshot("working")));
+        assert!(session.update_from_snapshot(&snapshot("idle")));
+        assert!(!session.is_working);
+    }
+
+    #[test]
     fn pane_title_tracks_current_agent_conversation() {
         let mut session = HerdrTerminalSession {
             name: "food-photo-apps-2".to_owned(),
             agent: None,
             agent_session: None,
             current_title: None,
+            is_working: false,
             initial_command: None,
             initial_command_sent: false,
         };

@@ -9005,8 +9005,8 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
-                title: "Terminal Thread Init Command",
-                description: "Command to automatically run when Zed creates a Terminal Thread shell in the agent panel. Runs in your configured shell.",
+                title: "Herdr Terminal Thread Init Command",
+                description: "Command to automatically run in a new Herdr Terminal Thread. Ordinary Terminal Threads open a plain shell.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("agent.terminal_init_command"),
@@ -9026,6 +9026,36 @@ fn ai_page(cx: &App) -> SettingsPage {
                 }),
                 metadata: Some(Box::new(SettingsFieldMetadata {
                     placeholder: Some("e.g. claude"),
+                    display_confirm_button: true,
+                    display_clear_button: true,
+                    confirm_on_focus_out: true,
+                    treat_missing_text_as_empty: true,
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Herdr Default Agent",
+                description: "Agent executable to start in a new Herdr Terminal Thread. Defaults to codex. Clear the value to open a Herdr shell without an agent. A custom init command takes precedence.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.terminal_herdr_default_agent"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .terminal_herdr_default_agent
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .terminal_herdr_default_agent = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("e.g. codex or claude"),
                     display_confirm_button: true,
                     display_clear_button: true,
                     confirm_on_focus_out: true,

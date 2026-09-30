@@ -242,6 +242,7 @@ pub struct AgentSettings {
     pub expand_edit_card: bool,
     pub expand_terminal_card: bool,
     pub terminal_init_command: Option<String>,
+    pub terminal_herdr_default_agent: Option<String>,
     pub terminal_herdr_enabled: bool,
     pub terminal_herdr_session_name_regex: Option<String>,
     pub thinking_display: ThinkingBlockDisplay,
@@ -840,6 +841,9 @@ impl Settings for AgentSettings {
             terminal_init_command: agent
                 .terminal_init_command
                 .filter(|command| !command.trim().is_empty()),
+            terminal_herdr_default_agent: agent
+                .terminal_herdr_default_agent
+                .filter(|agent| !agent.trim().is_empty()),
             terminal_herdr_enabled: agent.terminal_herdr_enabled.unwrap_or(false),
             terminal_herdr_session_name_regex: agent
                 .terminal_herdr_session_name_regex
@@ -1403,6 +1407,32 @@ mod tests {
         assert!(
             AgentSettings::get_global(cx)
                 .terminal_init_command
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    fn test_herdr_default_agent_can_be_disabled(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        assert_eq!(
+            AgentSettings::get_global(cx)
+                .terminal_herdr_default_agent
+                .as_deref(),
+            Some("codex")
+        );
+
+        SettingsStore::update_global(cx, |store, cx| {
+            store
+                .set_user_settings(r#"{ "agent": { "terminal_herdr_default_agent": "" } }"#, cx)
+                .unwrap();
+        });
+        assert!(
+            AgentSettings::get_global(cx)
+                .terminal_herdr_default_agent
                 .is_none()
         );
     }
