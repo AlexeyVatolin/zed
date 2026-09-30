@@ -130,7 +130,6 @@ gpui_platform = { workspace = true, features = [
 gpui_tokio.workspace = true
 hang_telemetry.workspace = true
 image = { workspace = true, optional = true }
-spin = "0.10.0"
 itertools.workspace = true
 rayon.workspace = true
 semver.workspace = true
@@ -289,8 +288,8 @@ osx_url_schemes = ["zed"]
 
 [package.metadata.bundle-nightly]
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]
-identifier = "dev.zed.Zed-Nightly"
-name = "Zed Nightly"
+identifier = "io.github.alexeyvatolin.ZedCustom"
+name = "Zed Custom"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["zed"]
