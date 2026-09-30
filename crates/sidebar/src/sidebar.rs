@@ -69,7 +69,9 @@ use workspace::{
     CloseWindow, FocusWorkspaceSidebar, MoveProjectDown, MoveProjectUp, MultiWorkspace,
     MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread,
     ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
-    ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, sidebar_side_context_menu,
+    ToggleWorkspaceSidebar, Workspace,
+    notifications::{DetachAndPromptErr, NotificationId},
+    sidebar_side_context_menu,
 };
 
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
@@ -788,6 +790,7 @@ pub struct Sidebar {
     /// Threads in the database-backed regeneration path need their own loading
     /// state because they do not have a live `agent::Thread` to report it.
     regenerating_titles: HashSet<ThreadId>,
+    herdr_archiving: HashSet<TerminalId>,
     /// Starting a rename must seed the current title into the title editor,
     /// so this prevents that BufferEdited event from being interpreted as user input.
     suppress_next_rename_edit: bool,
@@ -950,6 +953,7 @@ impl Sidebar {
             hovered_thread_index: None,
             rename_target: None,
             regenerating_titles: HashSet::new(),
+            herdr_archiving: HashSet::new(),
             suppress_next_rename_edit: false,
 
             thread_last_accessed: HashMap::new(),
@@ -1604,7 +1608,13 @@ impl Sidebar {
                 .flat_map(|ws| all_thread_infos_for_workspace(ws, cx));
 
             let mut threads: Vec<Arc<ThreadEntry>> = Vec::new();
-            let mut has_running_threads = false;
+            let mut has_running_threads = terminals.iter().any(|terminal| {
+                terminal
+                    .metadata
+                    .herdr_session
+                    .as_ref()
+                    .is_some_and(|session| session.is_working)
+            });
             let mut waiting_thread_count: usize = 0;
             let group_host = group_key.host();
 
@@ -2705,6 +2715,33 @@ impl Sidebar {
                         project.is_via_collab() || project.repositories(cx).is_empty()
                     });
 
+                    if let Some(workspace) = base_workspace.as_ref() {
+                        let options = workspace
+                            .read(cx)
+                            .project()
+                            .read(cx)
+                            .remote_client()
+                            .map(|client| client.read(cx).connection_options());
+                        if let Some(options) = options.filter(|options| {
+                            workspace::arc_workspaces::config_for_connection(options, cx).is_some()
+                        }) {
+                            let workspace = workspace.clone();
+                            menu = menu.separator().entry(
+                                "Create Arc Workspace…",
+                                None,
+                                move |window, cx| {
+                                    recent_projects::open_arc_workspace_modal(
+                                        &workspace,
+                                        options.clone(),
+                                        false,
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            );
+                        }
+                    }
+
                     if let Some(base_workspace) = base_workspace.filter(|_| !creation_blocked) {
                         menu = menu.separator().submenu("Create New Worktree…", {
                             let this = this.clone();
@@ -3180,9 +3217,61 @@ impl Sidebar {
                                 )
                         });
 
+                        let arc_workspace = workspace::arc_workspaces::managed_workspace_for_group(
+                            &project_group_key,
+                            menu_cx,
+                        );
+                        let source_workspace = active_workspace
+                            .clone()
+                            .or_else(|| open_workspaces.first().cloned());
                         let project_group_key = project_group_key.clone();
                         let remove_multi_workspace = multi_workspace.clone();
-                        menu.separator().entry("Remove", None, move |window, cx| {
+                        let label = if arc_workspace.is_some() {
+                            "Delete Arc Workspace…"
+                        } else {
+                            "Remove"
+                        };
+                        menu.separator().entry(label, None, move |window, cx| {
+                            if let (Some((options, arc_workspace)), Some(source)) =
+                                (arc_workspace.clone(), source_workspace.clone())
+                            {
+                                let task = recent_projects::delete_arc_workspace(
+                                    &source,
+                                    options,
+                                    arc_workspace,
+                                    window,
+                                    cx,
+                                );
+                                let remove_multi_workspace = remove_multi_workspace.clone();
+                                let project_group_key = project_group_key.clone();
+                                window
+                                    .spawn(cx, async move |cx| {
+                                        if task.await? {
+                                            let removal = remove_multi_workspace.update_in(
+                                                cx,
+                                                |multi_workspace, window, cx| {
+                                                    multi_workspace.remove_project_group(
+                                                        &project_group_key,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                },
+                                            )?;
+                                            removal.await?;
+                                        }
+                                        Ok::<_, anyhow::Error>(())
+                                    })
+                                    .detach_and_prompt_err(
+                                        "Failed to delete Arc workspace",
+                                        window,
+                                        cx,
+                                        |_, _, _| None,
+                                    );
+                                weak_menu
+                                    .update(cx, |_, cx| cx.emit(DismissEvent))
+                                    .log_err();
+                                return;
+                            }
                             remove_multi_workspace
                                 .update(cx, |multi_workspace, cx| {
                                     multi_workspace
@@ -5100,6 +5189,115 @@ impl Sidebar {
             return;
         }
 
+        if let Some(session) = &metadata.herdr_session {
+            if !self.herdr_archiving.insert(metadata.terminal_id) {
+                return;
+            }
+            let mut build_command = |args: &[String]| match workspace {
+                ThreadEntryWorkspace::Open(workspace) => agent_ui::herdr_terminal_thread::command(
+                    workspace.read(cx).project().clone(),
+                    args,
+                    None,
+                    cx,
+                ),
+                ThreadEntryWorkspace::Closed { .. } if metadata.remote_connection.is_none() => {
+                    let mut command = std::process::Command::new("herdr");
+                    command.args(args);
+                    Task::ready(Ok(command))
+                }
+                ThreadEntryWorkspace::Closed { .. } => Task::ready(Err(anyhow::anyhow!(
+                    "Connect to the remote workspace to archive its Herdr terminal"
+                ))),
+            };
+            let stop = build_command(&[
+                "session".to_owned(),
+                "stop".to_owned(),
+                session.name.clone(),
+                "--json".to_owned(),
+            ]);
+            let delete = build_command(&[
+                "session".to_owned(),
+                "delete".to_owned(),
+                session.name.clone(),
+                "--json".to_owned(),
+            ]);
+            let list =
+                build_command(&["session".to_owned(), "list".to_owned(), "--json".to_owned()]);
+            let metadata = metadata.clone();
+            let workspace = workspace.clone();
+            let session_name = session.name.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                let result = async {
+                    let stop = stop.await?;
+                    let delete = delete.await?;
+                    let list = list.await?;
+                    cx
+                    .background_spawn(async move {
+                        let stop_result = agent_ui::herdr_terminal_thread::run(stop);
+                        let delete_result = agent_ui::herdr_terminal_thread::run(delete);
+                        match (stop_result, delete_result) {
+                            (stop_result, Ok(_)) => {
+                                if let Err(stop_error) = stop_result {
+                                    log::warn!(
+                                        "Herdr session was deleted after stop failed: {stop_error:#}"
+                                    );
+                                }
+                                Ok(())
+                            }
+                            (stop_result, Err(delete_error)) => {
+                                let sessions = agent_ui::herdr_terminal_thread::run(list)
+                                    .and_then(|value| {
+                                        agent_ui::herdr_terminal_thread::session_names(&value)
+                                    });
+                                if sessions.is_ok_and(|names| !names.contains(&session_name)) {
+                                    Ok(())
+                                } else if let Err(stop_error) = stop_result {
+                                    Err(anyhow::anyhow!(
+                                        "Herdr stop failed: {stop_error:#}; delete failed: {delete_error:#}"
+                                    ))
+                                } else {
+                                    Err(delete_error)
+                                }
+                            }
+                        }
+                    })
+                    .await
+                }.await;
+                match result {
+                    Ok(()) => {
+                        this.update_in(cx, |this, window, cx| {
+                            this.herdr_archiving.remove(&metadata.terminal_id);
+                            this.close_terminal_after_herdr_cleanup(&metadata, &workspace, window, cx)
+                        })?;
+                    }
+                    Err(error) => {
+                        this.update(cx, |this, _cx| {
+                            this.herdr_archiving.remove(&metadata.terminal_id);
+                        })?;
+                        if let ThreadEntryWorkspace::Open(workspace) = &workspace {
+                            workspace
+                                .update(cx, |workspace, cx| workspace.show_error(error, cx));
+                        } else {
+                            log::error!("cannot archive Herdr terminal: {error:#}");
+                        }
+                    }
+                }
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+            return;
+        }
+
+        self.close_terminal_after_herdr_cleanup(metadata, workspace, window, cx);
+    }
+
+    fn close_terminal_after_herdr_cleanup(
+        &mut self,
+        metadata: &TerminalThreadMetadata,
+        workspace: &ThreadEntryWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let terminal_id = metadata.terminal_id;
         let is_active = self
             .active_entry
@@ -6626,7 +6824,15 @@ impl Sidebar {
 
         let terminal_item = ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
-            .icon(IconName::Terminal)
+            .icon(terminal.metadata.icon())
+            .when(
+                terminal
+                    .metadata
+                    .herdr_session
+                    .as_ref()
+                    .is_some_and(|session| session.is_working),
+                |this| this.status(AgentThreadStatus::Running),
+            )
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
             .is_remote(is_remote)
             .worktrees(worktrees)
