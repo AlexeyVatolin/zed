@@ -203,6 +203,10 @@ fn main() {
     #[cfg(unix)]
     util::prevent_root_execution();
 
+    if let Some(exit_code) = util::terminal_agent::run_helper_if_requested() {
+        std::process::exit(exit_code);
+    }
+
     let args = Args::parse();
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass

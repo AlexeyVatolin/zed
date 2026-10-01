@@ -2,15 +2,37 @@ use std::{collections::HashSet, path::Path, process::Command};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use collections::HashMap;
-use gpui::{Entity, Task};
+use gpui::{AppContext as _, Entity, Task};
 use project::Project;
 use regex::Regex;
 use remote::Interactive;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ui::{App, IconName};
+use util::paths::PathStyle;
 
 const MAX_HERDR_SESSION_NAME_BYTES: usize = 64;
+pub const INSTALL_COMMAND: &str = "curl -fsSL https://herdr.dev/install.sh | sh";
+const MISSING_HERDR: &str = "zed: herdr executable not found";
+const LAUNCH_SCRIPT: &str = r#"if command -v herdr >/dev/null 2>&1; then
+    exec herdr "$@"
+elif [ -x "${HERDR_INSTALL_DIR:-$HOME/.local/bin}/herdr" ]; then
+    exec "${HERDR_INSTALL_DIR:-$HOME/.local/bin}/herdr" "$@"
+else
+    echo "zed: herdr executable not found" >&2
+    exit 127
+fi"#;
+
+#[derive(Debug)]
+pub struct HerdrNotInstalled;
+
+impl std::fmt::Display for HerdrNotInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Herdr is not installed on the terminal host")
+    }
+}
+
+impl std::error::Error for HerdrNotInstalled {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HerdrTerminalSession {
@@ -49,10 +71,14 @@ impl HerdrTerminalSession {
         self.current_title.as_deref().unwrap_or(&self.name)
     }
 
-    pub fn attach_command(&self) -> String {
+    pub fn attach_command(&self, path_style: PathStyle) -> String {
         // A Herdr name is restricted to ASCII letters, digits, dots, underscores,
         // and hyphens, so this command cannot acquire shell syntax from a path.
-        format!("herdr --session {}", self.name)
+        if path_style.is_posix() {
+            format!("sh -c '{LAUNCH_SCRIPT}' zed-herdr --session {}", self.name)
+        } else {
+            format!("herdr --session {}", self.name)
+        }
     }
 
     pub fn update_from_snapshot(&mut self, snapshot: &Value) -> bool {
@@ -206,6 +232,56 @@ pub fn command(
     if let Some(session) = session {
         environment.insert("HERDR_SESSION".to_owned(), session.to_owned());
     }
+    let (program, args) = if project.read(cx).path_style(cx).is_posix() {
+        let mut launch_args = vec![
+            "-c".to_owned(),
+            LAUNCH_SCRIPT.to_owned(),
+            "zed-herdr".to_owned(),
+        ];
+        launch_args.extend_from_slice(args);
+        ("sh", launch_args)
+    } else {
+        ("herdr", args.to_vec())
+    };
+    host_command(project, program, &args, environment, cx)
+}
+
+pub fn install_command(project: Entity<Project>, cx: &mut App) -> Task<Result<Command>> {
+    host_command(
+        project,
+        "bash",
+        &[
+            "-o".to_owned(),
+            "pipefail".to_owned(),
+            "-c".to_owned(),
+            INSTALL_COMMAND.to_owned(),
+        ],
+        HashMap::default(),
+        cx,
+    )
+}
+
+pub fn list_sessions(project: Entity<Project>, cx: &mut App) -> Task<Result<HashSet<String>>> {
+    let command = command(
+        project,
+        &["session".to_owned(), "list".to_owned(), "--json".to_owned()],
+        None,
+        cx,
+    );
+    cx.spawn(async move |cx| {
+        let command = command.await?;
+        cx.background_spawn(async move { session_names(&run(command)?) })
+            .await
+    })
+}
+
+fn host_command(
+    project: Entity<Project>,
+    program: &str,
+    args: &[String],
+    environment: HashMap<String, String>,
+    cx: &mut App,
+) -> Task<Result<Command>> {
     let (remote_client, directory, project_environment) = {
         let project = project.read(cx);
         (
@@ -224,6 +300,7 @@ pub fn command(
             environment.directory_environment(directory, cx)
         });
         let args = args.to_vec();
+        let program = program.to_owned();
         cx.spawn(async move |cx| {
             let mut shell_environment = shell_environment
                 .await
@@ -231,7 +308,7 @@ pub fn command(
             shell_environment.extend(environment);
             let template = remote_client.read_with(cx, |client, _| {
                 client.build_command(
-                    Some("herdr".to_owned()),
+                    Some(program),
                     &args,
                     &shell_environment,
                     None,
@@ -244,7 +321,7 @@ pub fn command(
             Ok(command)
         })
     } else {
-        let mut command = Command::new("herdr");
+        let mut command = Command::new(program);
         command.args(args).envs(environment);
         Task::ready(Ok(command))
     }
@@ -252,6 +329,11 @@ pub fn command(
 
 pub fn run(mut command: Command) -> Result<Value> {
     let output = command.output().context("run Herdr command")?;
+    if output.status.code() == Some(127)
+        && String::from_utf8_lossy(&output.stderr).trim() == MISSING_HERDR
+    {
+        return Err(HerdrNotInstalled.into());
+    }
     let response: Option<Value> = serde_json::from_slice(&output.stdout).ok();
     if let Some(error) = response.as_ref().and_then(|value| value.get("error")) {
         bail!("Herdr returned an error: {error}");
@@ -269,6 +351,18 @@ pub fn run(mut command: Command) -> Result<Value> {
     response.ok_or_else(|| anyhow!("Herdr returned an invalid JSON response"))
 }
 
+pub fn install(mut command: Command) -> Result<()> {
+    let output = command.output().context("run Herdr installer")?;
+    if !output.status.success() {
+        bail!(
+            "Herdr installation failed: {}{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    Ok(())
+}
+
 pub fn session_names(value: &Value) -> Result<HashSet<String>> {
     let sessions = value
         .get("sessions")
@@ -284,6 +378,59 @@ pub fn session_names(value: &Value) -> Result<HashSet<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_binary_is_distinct_from_herdr_and_transport_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut missing = Command::new("/bin/sh");
+        missing
+            .args([
+                "-c",
+                LAUNCH_SCRIPT,
+                "zed-herdr",
+                "session",
+                "list",
+                "--json",
+            ])
+            .env("HOME", directory.path())
+            .env("PATH", directory.path())
+            .env_remove("HERDR_INSTALL_DIR");
+        assert!(run(missing).unwrap_err().is::<HerdrNotInstalled>());
+
+        for script in [
+            "echo 'Herdr failed' >&2; exit 127",
+            "echo 'SSH failed' >&2; exit 255",
+            "echo '{\"error\":\"server unavailable\"}'",
+        ] {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script]);
+            assert!(!run(command).unwrap_err().is::<HerdrNotInstalled>());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_binary_outside_path_runs_with_arguments_and_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let binary = bin.join("herdr");
+        std::fs::write(&binary, "#!/bin/sh\nprintf '{\"session\":\"%s\",\"argument\":\"%s\"}' \"$HERDR_SESSION\" \"$1\"\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", LAUNCH_SCRIPT, "zed-herdr", "argument with spaces"])
+            .env("HOME", directory.path())
+            .env("PATH", directory.path())
+            .env("HERDR_SESSION", "workspace-1")
+            .env_remove("HERDR_INSTALL_DIR");
+        assert_eq!(
+            run(command).unwrap(),
+            serde_json::json!({"session":"workspace-1", "argument":"argument with spaces"})
+        );
+    }
 
     #[test]
     fn names_from_workspace_path_and_collisions() {
