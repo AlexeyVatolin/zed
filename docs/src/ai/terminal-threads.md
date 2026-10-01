@@ -52,6 +52,33 @@ Set `terminal_herdr_default_agent` to `""` to open a Herdr shell without startin
 
 For a custom shell command, set `agent.terminal_init_command` in the Settings Editor under **AI**. A nonempty init command overrides the default agent for new Herdr threads. Regular Terminal threads still open a plain shell.
 
+## Restoring Claude and Codex {#restoring-terminal-agents}
+
+In a regular Terminal Thread, type `claude` or `codex` as usual. On macOS and
+Linux, Zed tracks these commands in Bash, Zsh, and Fish, including on an SSH host.
+When you reopen the thread after restarting Zed or reconnecting, Zed starts the
+same CLI in the folder where you launched it.
+
+Zed adds a `SessionStart` hook to Claude's `settings.json` or Codex's `hooks.json`
+on the terminal host. Existing settings and hooks are retained. The hook is
+inactive outside Zed Terminal Threads. If Codex asks you to review new hooks,
+approve this hook through its normal hook review UI. Disabled hooks remain
+disabled.
+
+When the hook reports a conversation ID that belongs to this terminal, Zed uses
+`claude --resume ID` or `codex resume ID`. A shared Codex App Server cannot reliably
+associate its hook with the initiating terminal. If the conversation ID is
+unknown, Zed opens `codex` without a resume argument. Zed never selects the latest
+conversation from history.
+
+Exiting the CLI returns the thread to an ordinary shell. Shell threads continue
+to restore as shells. Starting an agent by an absolute executable path or bypassing
+the shell function with `command` does not enable session tracking. Existing shell
+aliases and functions are kept and also bypass tracking.
+
+This restores the conversation, not the running process or an unfinished request.
+Use a Herdr thread below to keep the terminal process alive across disconnections.
+
 ## Persistent Herdr Sessions {#persistent-herdr-sessions}
 
 Choose **Herdr Terminal Thread** from the new thread menu, or press {#kb agent::NewHerdrTerminalThread}. This action always creates a named [Herdr](https://herdr.dev/) session, regardless of which agent type you created last. **Terminal** in the same menu always creates a regular terminal.

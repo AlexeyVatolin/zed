@@ -147,6 +147,8 @@ messages!(
     (GetSignatureHelpResponse, Background),
     (GetTerminalShell, Background),
     (GetTerminalShellResponse, Background),
+    (TerminalAgentSessionUpdated, Background),
+    (CloseTerminalAgentIntegration, Background),
     (GetTypeDefinition, Background),
     (GetTypeDefinitionResponse, Background),
     (GetImplementation, Background),
@@ -864,6 +866,8 @@ entity_messages!(
     ToggleLspLogs,
     GetDirectoryEnvironment,
     GetTerminalShell,
+    TerminalAgentSessionUpdated,
+    CloseTerminalAgentIntegration,
 
     Push,
     Fetch,

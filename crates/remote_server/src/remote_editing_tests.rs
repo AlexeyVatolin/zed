@@ -849,6 +849,104 @@ async fn test_remote_project_search_reports_untitled_buffer_once(
     assert_eq!(result_buffers.len(), 2);
 }
 
+#[cfg(unix)]
+#[gpui::test]
+async fn test_remote_terminal_agent_session_notifications(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    // Unix socket readiness is delivered by the OS reactor.
+    cx.executor().allow_parking();
+    server_cx.executor().allow_parking();
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let terminal_thread_id = uuid::Uuid::new_v4().to_string();
+    let request = project.read_with(cx, |project, cx| {
+        project
+            .remote_client()
+            .unwrap()
+            .read(cx)
+            .proto_client()
+            .request(proto::GetTerminalShell {
+                project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                worktree_id: None,
+                terminal_thread_id: Some(terminal_thread_id.clone()),
+            })
+    });
+    let response = request.await.unwrap();
+    let socket = response
+        .agent_environment
+        .get("ZED_TERMINAL_AGENT_SOCKET")
+        .unwrap();
+    let session = util::terminal_agent::TerminalAgentSession {
+        agent: util::terminal_agent::TerminalAgent::Codex,
+        session_id: None,
+        working_directory: "/remote/project".into(),
+    };
+    let payload =
+        serde_json::to_vec(&json!({ "event": "started", "launch": "launch", "session": session }))
+            .unwrap();
+    use std::io::Write as _;
+    let mut connection = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    connection.write_all(&payload).unwrap();
+    drop(connection);
+    cx.condition(&project, |project, _| {
+        project
+            .terminal_agent_session(&terminal_thread_id)
+            .is_some()
+    })
+    .await;
+    project.read_with(cx, |project, _| {
+        assert_eq!(
+            project.terminal_agent_session(&terminal_thread_id),
+            Some(&session)
+        )
+    });
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut connection = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    serde_json::to_writer(
+        &mut connection,
+        &json!({ "event": "session", "launch": "launch", "session_id": session_id }),
+    )
+    .unwrap();
+    drop(connection);
+    cx.condition(&project, |project, _| {
+        project
+            .terminal_agent_session(&terminal_thread_id)
+            .is_some_and(|session| session.session_id.as_ref() == Some(&session_id))
+    })
+    .await;
+    let mut connection = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    serde_json::to_writer(
+        &mut connection,
+        &json!({ "event": "exited", "launch": "launch" }),
+    )
+    .unwrap();
+    drop(connection);
+    cx.condition(&project, |project, _| {
+        project
+            .terminal_agent_session(&terminal_thread_id)
+            .is_none()
+    })
+    .await;
+    project
+        .read_with(cx, |project, cx| {
+            project
+                .remote_client()
+                .unwrap()
+                .read(cx)
+                .proto_client()
+                .send(proto::CloseTerminalAgentIntegration {
+                    project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                    terminal_thread_id,
+                })
+        })
+        .unwrap();
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    assert!(!std::path::Path::new(socket).exists());
+}
+
 #[gpui::test]
 async fn test_remote_settings(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
@@ -922,6 +1020,7 @@ async fn test_remote_settings(cx: &mut TestAppContext, server_cx: &mut TestAppCo
                 remote_client
                     .proto_client()
                     .request(proto::GetTerminalShell {
+                        terminal_thread_id: None,
                         project_id: proto::REMOTE_SERVER_PROJECT_ID,
                         worktree_id: None,
                     })

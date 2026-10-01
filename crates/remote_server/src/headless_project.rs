@@ -9,7 +9,7 @@ use lsp::LanguageServerId;
 use extension::ExtensionHostProxy;
 use extension_host::headless_host::HeadlessExtensionStore;
 use fs::Fs;
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, PromptLevel, TaskExt};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, PromptLevel, Task, TaskExt};
 use http_client::HttpClient;
 use language::{Buffer, BufferEvent, LanguageRegistry, proto::serialize_operation};
 use node_runtime::NodeRuntime;
@@ -74,6 +74,7 @@ pub struct HeadlessProject {
     // Local variant is used within LSP store, but that's a separate entity.
     pub _toolchain_store: Entity<ToolchainStore>,
     pub kernels: HashMap<String, Child>,
+    terminal_agent_integrations: HashMap<String, Task<()>>,
 }
 
 pub struct HeadlessAppState {
@@ -308,6 +309,7 @@ impl HeadlessProject {
         session.add_entity_request_handler(Self::handle_open_server_settings);
         session.add_entity_request_handler(Self::handle_get_directory_environment);
         session.add_entity_request_handler(Self::handle_get_terminal_shell);
+        session.add_entity_message_handler(Self::handle_close_terminal_agent_integration);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_arcadia_link);
         session.add_entity_message_handler(Self::handle_toggle_lsp_logs);
         session.add_entity_request_handler(Self::handle_open_image_by_path);
@@ -364,6 +366,7 @@ impl HeadlessProject {
             profiling_collector: gpui::ProfilingCollector::new(startup_time),
             _toolchain_store: toolchain_store,
             kernels: Default::default(),
+            terminal_agent_integrations: Default::default(),
         }
     }
 
@@ -1435,10 +1438,22 @@ impl HeadlessProject {
         Ok(proto::DirectoryEnvironment { environment })
     }
 
+    async fn handle_close_terminal_agent_integration(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::CloseTerminalAgentIntegration>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        this.update(&mut cx, |this, _| {
+            this.terminal_agent_integrations
+                .remove(&envelope.payload.terminal_thread_id);
+        });
+        Ok(())
+    }
+
     async fn handle_get_terminal_shell(
-        _this: Entity<Self>,
+        this: Entity<Self>,
         envelope: TypedEnvelope<proto::GetTerminalShell>,
-        cx: AsyncApp,
+        mut cx: AsyncApp,
     ) -> Result<proto::GetTerminalShellResponse> {
         let worktree_id = envelope.payload.worktree_id.map(WorktreeId::from_proto);
         let shell = cx.update(|cx| {
@@ -1450,8 +1465,46 @@ impl HeadlessProject {
         });
         log::debug!("handle_get_terminal_shell: resolved remote terminal shell setting: {shell:?}");
 
+        let mut agent_environment = Default::default();
+        #[cfg(unix)]
+        if let Some(terminal_thread_id) = envelope.payload.terminal_thread_id {
+            let mut integration = cx
+                .background_spawn(async { util::terminal_agent::TerminalAgentIntegration::new() })
+                .await?;
+            agent_environment = integration
+                .environment(&shell.program())?
+                .into_iter()
+                .collect();
+            this.update(&mut cx, |this, cx| {
+                let session = this.session.clone();
+                let terminal_thread_id_for_task = terminal_thread_id.clone();
+                let listener = cx.spawn(async move |_, _| {
+                    loop {
+                        let result = async {
+                            let state = integration.next_session().await?;
+                            session.send(proto::TerminalAgentSessionUpdated {
+                                project_id: REMOTE_SERVER_PROJECT_ID,
+                                terminal_thread_id: terminal_thread_id_for_task.clone(),
+                                session: state
+                                    .map(|state| serde_json::to_string(&state))
+                                    .transpose()?,
+                            })?;
+                            anyhow::Ok(())
+                        }
+                        .await;
+                        if let Err(error) = result {
+                            log::error!("remote terminal session integration: {error:#}");
+                            break;
+                        }
+                    }
+                });
+                this.terminal_agent_integrations
+                    .insert(terminal_thread_id, listener);
+            });
+        }
         Ok(proto::GetTerminalShellResponse {
             shell: Some(task::shell_to_proto(shell)),
+            agent_environment,
         })
     }
 }

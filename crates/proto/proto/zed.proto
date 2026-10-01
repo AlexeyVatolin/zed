@@ -527,7 +527,9 @@ message Envelope {
     GetTerminalShellResponse get_terminal_shell_response = 495;
     GetArcadiaLink get_arcadia_link = 496;
     GetArcadiaLinkResponse get_arcadia_link_response = 497;
-    RefreshGitRepository refresh_git_repository = 498; // current max
+    RefreshGitRepository refresh_git_repository = 498;
+    TerminalAgentSessionUpdated terminal_agent_session_updated = 499;
+    CloseTerminalAgentIntegration close_terminal_agent_integration = 500; // current max
   }
 
   reserved 87 to 88;

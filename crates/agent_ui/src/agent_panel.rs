@@ -962,6 +962,7 @@ struct AgentTerminal {
     last_known_terminal_title: String,
     last_observed_program: Option<String>,
     herdr_session: Option<HerdrTerminalSession>,
+    agent_session: Option<util::terminal_agent::TerminalAgentSession>,
     working_directory: Option<PathBuf>,
     created_at: DateTime<Utc>,
     has_notification: bool,
@@ -1514,6 +1515,17 @@ impl AgentPanel {
         let connection_store = cx.new(|cx| AgentConnectionStore::new(project.clone(), cx));
         let _project_subscription =
             cx.subscribe(&project, |this, _project, event, cx| match event {
+                project::Event::TerminalAgentSessionUpdated {
+                    terminal_thread_id,
+                    session,
+                } => {
+                    if let Ok(terminal_id) = TerminalId::from_key_string(terminal_thread_id)
+                        && let Some(terminal) = this.terminals.get_mut(&terminal_id)
+                    {
+                        terminal.agent_session = session.clone();
+                        this.persist_terminal_metadata(terminal_id, cx);
+                    }
+                }
                 project::Event::WorktreeAdded(_)
                 | project::Event::WorktreeRemoved(_)
                 | project::Event::WorktreeOrderChanged
@@ -2226,6 +2238,7 @@ impl AgentPanel {
                                         initial_command,
                                         initial_command_sent: false,
                                     }),
+                                    agent_session: None,
                                 },
                                 cx,
                             );
@@ -2354,11 +2367,30 @@ impl AgentPanel {
                 .entry(terminal_id)
                 .and_then(|metadata| metadata.herdr_session.clone())
         });
+        let agent_session = TerminalThreadMetadataStore::try_global(cx).and_then(|store| {
+            store
+                .read(cx)
+                .entry(terminal_id)
+                .and_then(|metadata| metadata.agent_session.clone())
+        });
         let init_command = herdr_session
             .as_ref()
             .map(|session| session.attach_command(self.project.read(cx).path_style(cx)))
+            .or_else(|| {
+                agent_session
+                    .as_ref()
+                    .map(|session| session.resume_command())
+            })
             .or_else(|| Self::terminal_init_command(run_init_command, cx));
-        let terminal_task = self.create_terminal_shell(working_directory, cx);
+        let terminal_task = self.create_terminal_shell(
+            working_directory,
+            if herdr_session.is_none() {
+                Some(terminal_id)
+            } else {
+                None
+            },
+            cx,
+        );
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
         let project = self.project.downgrade();
@@ -2415,6 +2447,7 @@ impl AgentPanel {
     fn create_terminal_shell(
         &mut self,
         working_directory: Option<PathBuf>,
+        terminal_id: Option<TerminalId>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<terminal::Terminal>>> {
         // A real shell ties the spawn's timing to the host, so a test that needs
@@ -2429,7 +2462,15 @@ impl AgentPanel {
         }
 
         self.project.update(cx, |project, cx| {
-            project.create_terminal_shell(working_directory, cx)
+            if let Some(terminal_id) = terminal_id {
+                project.create_agent_terminal_shell(
+                    working_directory,
+                    terminal_id.to_key_string(),
+                    cx,
+                )
+            } else {
+                project.create_terminal_shell(working_directory, cx)
+            }
         })
     }
 
@@ -2690,6 +2731,19 @@ impl AgentPanel {
                     .entry(terminal_id)
                     .and_then(|metadata| metadata.herdr_session.clone())
             }),
+            agent_session: self
+                .project
+                .read(cx)
+                .terminal_agent_session(&terminal_id.to_key_string())
+                .cloned()
+                .or_else(|| {
+                    TerminalThreadMetadataStore::try_global(cx).and_then(|store| {
+                        store
+                            .read(cx)
+                            .entry(terminal_id)
+                            .and_then(|metadata| metadata.agent_session.clone())
+                    })
+                }),
             working_directory,
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
@@ -2792,11 +2846,10 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .terminals
-            .get(&terminal_id)
-            .is_some_and(|terminal| terminal.herdr_session.is_some())
-        {
+        if self.terminals.get(&terminal_id).is_some_and(|terminal| {
+            terminal.herdr_session.is_some() || terminal.agent_session.is_some()
+        }) {
+            self.persist_terminal_metadata(terminal_id, cx);
             cx.defer_in(window, move |this, window, cx| {
                 this.terminals.remove(&terminal_id);
                 if this.active_terminal_id() == Some(terminal_id) {
@@ -2889,6 +2942,7 @@ impl AgentPanel {
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
             herdr_session: terminal.herdr_session.clone(),
+            agent_session: terminal.agent_session.clone(),
         })
     }
 
@@ -2910,9 +2964,13 @@ impl AgentPanel {
             return;
         }
 
-        let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
+        let working_directory = metadata
+            .agent_session
+            .as_ref()
+            .map(|session| session.working_directory.clone())
+            .or_else(|| self.terminal_restore_working_directory(&metadata, workspace, cx));
         let initial_title = Self::terminal_restore_initial_title(&metadata);
-        if metadata.herdr_session.is_some() {
+        if metadata.herdr_session.is_some() || metadata.agent_session.is_some() {
             TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.save(metadata.clone(), cx);
             });
@@ -7289,7 +7347,15 @@ impl AgentPanel {
             return Ok(());
         }
 
-        let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
+        let working_directory = metadata
+            .agent_session
+            .as_ref()
+            .map(|session| session.working_directory.clone())
+            .or_else(|| self.terminal_restore_working_directory(&metadata, workspace, cx));
+        if metadata.agent_session.is_some() {
+            TerminalThreadMetadataStore::global(cx)
+                .update(cx, |store, cx| store.save(metadata.clone(), cx));
+        }
         let initial_title = Self::terminal_restore_initial_title(&metadata);
         self.insert_display_only_terminal(
             metadata.terminal_id,
@@ -7336,7 +7402,16 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = TerminalThreadMetadataStore::try_global(cx)
+            .and_then(|store| {
+                store.read(cx).entry(terminal_id).and_then(|metadata| {
+                    metadata
+                        .agent_session
+                        .as_ref()
+                        .map(|session| session.resume_command())
+                })
+            })
+            .or_else(|| Self::terminal_init_command(run_init_command, cx));
         let terminal = self.build_display_only_terminal(cx);
         let terminal_for_init_command = terminal.clone();
         let terminal_view = cx.new(|cx| {
@@ -8124,6 +8199,7 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             herdr_session: None,
+            agent_session: None,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -8258,6 +8334,141 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_terminal_agent_session_restore_and_exit(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            crate::terminal_thread_metadata_store::init(cx);
+        });
+        for (agent, session_id) in [
+            (
+                util::terminal_agent::TerminalAgent::Claude,
+                Some(uuid::Uuid::new_v4().to_string()),
+            ),
+            (
+                util::terminal_agent::TerminalAgent::Codex,
+                Some(uuid::Uuid::new_v4().to_string()),
+            ),
+            (util::terminal_agent::TerminalAgent::Codex, None),
+        ] {
+            let session = util::terminal_agent::TerminalAgentSession {
+                agent,
+                session_id,
+                working_directory: "/launch-folder".into(),
+            };
+            let metadata = TerminalThreadMetadata {
+                terminal_id: TerminalId::new(),
+                title: "Agent".into(),
+                custom_title: None,
+                created_at: Utc::now(),
+                worktree_paths: WorktreePaths::default(),
+                remote_connection: None,
+                working_directory: Some("/original-folder".into()),
+                herdr_session: None,
+                agent_session: Some(session.clone()),
+            };
+            let terminal_id = metadata.terminal_id;
+            panel
+                .update_in(&mut cx, |panel, window, cx| {
+                    panel.restore_test_terminal(
+                        metadata.clone(),
+                        true,
+                        AgentThreadSource::AgentPanel,
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+                .unwrap();
+            let terminal = panel.read_with(&cx, |panel, cx| {
+                panel.terminals[&terminal_id]
+                    .view
+                    .read(cx)
+                    .terminal()
+                    .clone()
+            });
+            assert_eq!(
+                terminal
+                    .update(&mut cx, |terminal, _| terminal.take_input_log())
+                    .concat(),
+                AgentPanel::terminal_init_command_input(session.resume_command())
+            );
+            panel.read_with(&cx, |panel, _| {
+                assert_eq!(
+                    panel.terminals[&terminal_id].working_directory.as_ref(),
+                    Some(&session.working_directory)
+                )
+            });
+            panel.update(&mut cx, |panel, cx| {
+                panel.project.update(cx, |_, cx| {
+                    cx.emit(project::Event::TerminalAgentSessionUpdated {
+                        terminal_thread_id: terminal_id.to_key_string(),
+                        session: None,
+                    })
+                })
+            });
+            cx.run_until_parked();
+            assert!(panel.read_with(&cx, |panel, cx| {
+                panel
+                    .terminal_metadata(terminal_id, cx)
+                    .unwrap()
+                    .agent_session
+                    .is_none()
+            }));
+        }
+    }
+
+    #[gpui::test]
+    async fn test_closed_agent_terminal_keeps_resume_metadata(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            crate::terminal_thread_metadata_store::init(cx);
+        });
+        let metadata = TerminalThreadMetadata {
+            terminal_id: TerminalId::new(),
+            title: "Codex".into(),
+            custom_title: None,
+            created_at: Utc::now(),
+            worktree_paths: WorktreePaths::default(),
+            remote_connection: None,
+            working_directory: None,
+            herdr_session: None,
+            agent_session: Some(util::terminal_agent::TerminalAgentSession {
+                agent: util::terminal_agent::TerminalAgent::Codex,
+                session_id: None,
+                working_directory: "/project".into(),
+            }),
+        };
+        let terminal_id = metadata.terminal_id;
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.restore_test_terminal(
+                    metadata,
+                    true,
+                    AgentThreadSource::AgentPanel,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.request_close_terminal_from_terminal_event(terminal_id, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(!panel.read_with(&cx, |panel, _| panel.has_terminal(terminal_id)));
+        cx.update(|_, cx| {
+            assert!(
+                TerminalThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(terminal_id)
+                    .unwrap()
+                    .agent_session
+                    .is_some()
+            )
+        });
+    }
+
+    #[gpui::test]
     async fn test_restored_plain_terminal_does_not_run_init_command(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         cx.update(|_, cx| {
@@ -8277,6 +8488,7 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             herdr_session: None,
+            agent_session: None,
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -8452,6 +8664,7 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             herdr_session: None,
+            agent_session: None,
         };
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -10711,6 +10924,7 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             herdr_session: None,
+            agent_session: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -10763,6 +10977,7 @@ mod tests {
             remote_connection: None,
             working_directory: None,
             herdr_session: None,
+            agent_session: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
