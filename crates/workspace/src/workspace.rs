@@ -1,3 +1,4 @@
+pub mod arc_workspaces;
 pub mod active_file_name;
 pub mod dock;
 pub mod history_manager;

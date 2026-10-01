@@ -1368,13 +1368,24 @@
     //
     // Default: true
     "expand_terminal_card": true,
-    // Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
+    // Command to automatically run when Zed creates a Herdr Terminal Thread.
     // The command is sent to the shell as if typed, so it is interpreted by your
     // configured shell (including on Windows and remote/WSL projects).
     // Set to "" to disable.
     //
+    // Ordinary Terminal Threads always open a plain shell.
     // Example: "terminal_init_command": "claude"
     "terminal_init_command": "",
+    // Agent to start in each new Herdr Terminal Thread. An empty value leaves
+    // the Herdr pane at a shell prompt. terminal_init_command overrides this.
+    "terminal_herdr_default_agent": "codex",
+    // Use Herdr for default Terminal Threads when the last created agent was a terminal.
+    // Explicit Terminal and Herdr Terminal Thread menu actions always create their named type.
+    "terminal_herdr_enabled": false,
+    // First capture group (or full match) of the workspace path. An empty
+    // pattern uses the workspace directory name.
+    // Example: "/arcadia-worktrees/([^/]+)"
+    "terminal_herdr_session_name_regex": "",
     // How thinking blocks should be displayed by default in the agent panel.
     //
     // Default: auto
@@ -2936,6 +2947,17 @@
   //     ]
   //   }
   // ]
+  // To create Arc workspaces on an SSH server, add arc_workspaces to its entry:
+  // "arc_workspaces": {
+  //   "mount_root": "~/arcadia-worktrees",
+  //   "types": {
+  //     "cleanweb": "yweb/antispam/clean_web",
+  //     "pingers": "yweb/antispam/clean_web/pingers",
+  //     "bigmod": "modadvert/bigmod"
+  //   }
+  // }
+  // Created remote projects keep arc_workspace mount metadata for restoration
+  // and confirmed server-side deletion. Zed writes that metadata automatically.
   "ssh_connections": [],
   // Whether to read ~/.ssh/config for ssh connection sources.
   "read_ssh_config": true,

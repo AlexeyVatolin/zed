@@ -27,9 +27,115 @@ use crate::{Project, ProjectPath};
 
 pub struct Terminals {
     pub(crate) local_handles: Vec<WeakEntity<terminal::Terminal>>,
+    pub(crate) agent_integrations: HashMap<String, Task<()>>,
+    pub(crate) agent_sessions: HashMap<String, util::terminal_agent::TerminalAgentSession>,
 }
 
 impl Project {
+    pub fn create_agent_terminal_shell(
+        &mut self,
+        cwd: Option<PathBuf>,
+        terminal_thread_id: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_shell_internal(cwd, false, Some(terminal_thread_id), cx)
+    }
+
+    pub fn terminal_agent_session(
+        &self,
+        terminal_thread_id: &str,
+    ) -> Option<&util::terminal_agent::TerminalAgentSession> {
+        self.terminals.agent_sessions.get(terminal_thread_id)
+    }
+
+    fn update_terminal_agent_session(
+        &mut self,
+        terminal_thread_id: String,
+        session: Option<util::terminal_agent::TerminalAgentSession>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = &session {
+            self.terminals
+                .agent_sessions
+                .insert(terminal_thread_id.clone(), session.clone());
+        } else {
+            self.terminals.agent_sessions.remove(&terminal_thread_id);
+        }
+        cx.emit(crate::Event::TerminalAgentSessionUpdated {
+            terminal_thread_id,
+            session,
+        });
+        cx.notify();
+    }
+
+    pub(crate) async fn handle_terminal_agent_session_updated(
+        this: Entity<Self>,
+        envelope: rpc::TypedEnvelope<proto::TerminalAgentSessionUpdated>,
+        mut cx: gpui::AsyncApp,
+    ) -> Result<()> {
+        let session = envelope
+            .payload
+            .session
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
+        this.update(&mut cx, |this, cx| {
+            this.update_terminal_agent_session(envelope.payload.terminal_thread_id, session, cx)
+        });
+        Ok(())
+    }
+
+    fn prepare_terminal_agent_integration(
+        &mut self,
+        terminal_thread_id: String,
+        shell_program: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<HashMap<String, String>>> {
+        #[cfg(unix)]
+        return cx.spawn(async move |this, cx| {
+            let mut integration = cx
+                .background_spawn(async { util::terminal_agent::TerminalAgentIntegration::new() })
+                .await?;
+            let environment = integration
+                .environment(&shell_program)?
+                .into_iter()
+                .collect();
+            this.update(cx, |this, cx| {
+                let terminal_thread_id_for_task = terminal_thread_id.clone();
+                let task = cx.spawn(async move |this, cx| {
+                    loop {
+                        match integration.next_session().await {
+                            Ok(session) => {
+                                if this
+                                    .update(cx, |this, cx| {
+                                        this.update_terminal_agent_session(
+                                            terminal_thread_id_for_task.clone(),
+                                            session,
+                                            cx,
+                                        )
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                log::error!("terminal session integration: {error:#}");
+                                break;
+                            }
+                        }
+                    }
+                });
+                this.terminals
+                    .agent_integrations
+                    .insert(terminal_thread_id, task);
+            })?;
+            Ok(environment)
+        });
+        #[cfg(not(unix))]
+        Task::ready(Ok(HashMap::default()))
+    }
+
     pub fn active_entry_directory(&self, cx: &App) -> Option<PathBuf> {
         let entry_id = self.active_entry()?;
         let worktree = self.worktree_for_entry(entry_id, cx)?;
@@ -287,7 +393,7 @@ impl Project {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        self.create_terminal_shell_internal(cwd, false, cx)
+        self.create_terminal_shell_internal(cwd, false, None, cx)
     }
 
     /// Creates a local terminal even if the project is remote.
@@ -304,7 +410,7 @@ impl Project {
             // Local project: use project directory like normal terminals
             self.active_project_directory(cx).map(|p| p.to_path_buf())
         };
-        self.create_terminal_shell_internal(working_directory, true, cx)
+        self.create_terminal_shell_internal(working_directory, true, None, cx)
     }
 
     /// Internal method for creating terminal shells.
@@ -314,6 +420,7 @@ impl Project {
         &mut self,
         cwd: Option<PathBuf>,
         force_local: bool,
+        terminal_thread_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let path = cwd.map(|p| Arc::from(&*p));
@@ -360,6 +467,7 @@ impl Project {
                 .proto_client()
                 .request(proto::GetTerminalShell {
                     project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                    terminal_thread_id: terminal_thread_id.clone(),
                     worktree_id: settings_location
                         .map(|settings_location| settings_location.worktree_id.to_proto()),
                 })
@@ -384,10 +492,12 @@ impl Project {
 
         let lang_registry = self.languages.clone();
         cx.spawn(async move |project, cx| {
+            let mut agent_environment = HashMap::default();
             let remote_shell = if let Some(remote_shell_request) = remote_shell_request {
                 let response = remote_shell_request
                     .await
                     .context("failed to get terminal shell settings from remote server")?;
+                agent_environment.extend(response.agent_environment);
                 let shell = response
                     .shell
                     .context("remote server returned no terminal shell")?;
@@ -402,10 +512,24 @@ impl Project {
             };
             let shell_program = remote_shell.as_ref().map(Shell::program).unwrap_or(shell);
             let shell_kind = ShellKind::new(&shell_program, path_style.is_windows());
+            if remote_client.is_none()
+                && let Some(terminal_thread_id) = terminal_thread_id.clone()
+            {
+                agent_environment = project
+                    .update(cx, |project, cx| {
+                        project.prepare_terminal_agent_integration(
+                            terminal_thread_id,
+                            shell_program.clone(),
+                            cx,
+                        )
+                    })?
+                    .await?;
+            }
             let mut env = env_task.await.unwrap_or_default();
             env.extend(settings.env);
+            env.extend(agent_environment);
 
-            let activation_script = maybe!(async {
+            let mut activation_script = maybe!(async {
                 for toolchain in toolchains {
                     let Some(toolchain) = toolchain.await else {
                         continue;
@@ -423,6 +547,29 @@ impl Project {
             })
             .await
             .unwrap_or_default();
+
+            if env.contains_key("ZED_TERMINAL_AGENT_SCRIPT") {
+                let integration_shell = env
+                    .get("ZED_TERMINAL_AGENT_SHELL")
+                    .map(String::as_str)
+                    .unwrap_or(&shell_program);
+                let integration = match ShellKind::new(integration_shell, false) {
+                    ShellKind::Fish => {
+                        Some("source \"$ZED_TERMINAL_AGENT_SCRIPT/integration.fish\"")
+                    }
+                    ShellKind::Posix
+                        if Path::new(integration_shell)
+                            .file_name()
+                            .is_some_and(|name| name == "bash" || name == "zsh") =>
+                    {
+                        Some(". \"$ZED_TERMINAL_AGENT_SCRIPT/integration.sh\"")
+                    }
+                    _ => None,
+                };
+                if let Some(integration) = integration {
+                    activation_script.insert(0, integration.to_owned());
+                }
+            }
 
             let builder = project
                 .update(cx, move |_, cx| {
@@ -469,6 +616,23 @@ impl Project {
 
                 let id = terminal_handle.entity_id();
                 cx.observe_release(&terminal_handle, move |project, _terminal, cx| {
+                    if let Some(terminal_thread_id) = &terminal_thread_id {
+                        project
+                            .terminals
+                            .agent_integrations
+                            .remove(terminal_thread_id);
+                        project.terminals.agent_sessions.remove(terminal_thread_id);
+                        if let Some(remote_client) = &project.remote_client
+                            && let Err(error) = remote_client.read(cx).proto_client().send(
+                                proto::CloseTerminalAgentIntegration {
+                                    project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                                    terminal_thread_id: terminal_thread_id.clone(),
+                                },
+                            )
+                        {
+                            log::debug!("closing remote terminal session integration: {error:#}");
+                        }
+                    }
                     let handles = &mut project.terminals.local_handles;
 
                     if let Some(index) = handles

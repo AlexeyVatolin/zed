@@ -505,6 +505,10 @@ actions!(
         CopyFileNameWithoutExtension,
         /// Copies a permalink to the current line or selection.
         CopyPermalinkToLine,
+        /// Copies an Arcadia link to the current line or selection on trunk.
+        CopyArcadiaLinkToTrunk,
+        /// Copies an Arcadia link to the current line or selection on the current upstream branch.
+        CopyArcadiaLinkToCurrentBranch,
         /// Cuts selected text to the clipboard.
         Cut,
         /// Deletes the character after the cursor.
