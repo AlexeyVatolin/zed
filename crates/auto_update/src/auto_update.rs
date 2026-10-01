@@ -45,7 +45,8 @@ impl std::fmt::Display for MissingDependencyError {
 
 impl std::error::Error for MissingDependencyError {}
 const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
-const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const FORK_RELEASE_REPOSITORY: &str = "AlexeyVatolin/zed";
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
 
 #[cfg(target_os = "linux")]
@@ -193,6 +194,49 @@ pub struct AutoUpdater {
 pub struct ReleaseAsset {
     pub version: String,
     pub url: String,
+}
+
+fn release_asset_from_github(
+    release: http_client::github::GithubRelease,
+    asset: &str,
+    os: &str,
+    arch: &str,
+) -> Result<ReleaseAsset> {
+    let version = release
+        .tag_name
+        .strip_prefix('v')
+        .context("fork release tag must begin with v")?
+        .parse::<Version>()?;
+    anyhow::ensure!(
+        version.build.as_str().starts_with("nightly."),
+        "fork release must contain nightly build metadata"
+    );
+
+    let asset_name = match (asset, os, arch) {
+        ("zed", "macos", "aarch64") => "Zed-aarch64.dmg".to_string(),
+        ("zed", "linux", "x86_64") => "zed-linux-x86_64.tar.gz".to_string(),
+        ("zed-remote-server", "macos", "aarch64") => {
+            "zed-remote-server-macos-aarch64.gz".to_string()
+        }
+        ("zed-remote-server", "linux", "x86_64") => "zed-remote-server-linux-x86_64.gz".to_string(),
+        _ => anyhow::bail!("unsupported fork release asset: {asset} {os} {arch}"),
+    };
+    let url = release
+        .assets
+        .into_iter()
+        .find(|release_asset| release_asset.name == asset_name)
+        .with_context(|| {
+            format!(
+                "{asset_name} is missing from fork release {}",
+                release.tag_name
+            )
+        })?
+        .browser_download_url;
+
+    Ok(ReleaseAsset {
+        version: version.to_string(),
+        url,
+    })
 }
 
 struct MacOsUnmounter<'a> {
@@ -356,7 +400,7 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
             auto_updater.client.http_client().build_url(&path)
         }
         ReleaseChannel::Nightly => {
-            "https://github.com/zed-industries/zed/commits/nightly/".to_string()
+            format!("https://github.com/{FORK_RELEASE_REPOSITORY}/releases/latest")
         }
         ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
     };
@@ -684,6 +728,22 @@ impl AutoUpdater {
         cx: &mut AsyncApp,
     ) -> Result<ReleaseAsset> {
         let client = this.read_with(cx, |this, _| this.client.clone());
+        let http_client = client.http_client();
+
+        if release_channel == ReleaseChannel::Nightly {
+            let release = if let Some(version) = version {
+                http_client::github::get_release_by_tag_name(
+                    FORK_RELEASE_REPOSITORY,
+                    &format!("v{version}"),
+                    http_client,
+                )
+                .await?
+            } else {
+                http_client::github::get_latest_release(FORK_RELEASE_REPOSITORY, http_client)
+                    .await?
+            };
+            return release_asset_from_github(release, asset, os, arch);
+        }
 
         let (system_id, metrics_id, is_staff) = if client.telemetry().metrics_enabled() {
             (
@@ -702,8 +762,6 @@ impl AutoUpdater {
         } else {
             "latest".to_string()
         };
-        let http_client = client.http_client();
-
         let path = format!("/releases/{}/{}/asset", release_channel.dev_name(), version,);
         let url = http_client.build_zed_cloud_url_with_query(
             &path,
@@ -1162,7 +1220,11 @@ async fn install_release_linux(
     } else {
         String::default()
     };
-    let app_folder_name = format!("zed{}.app", suffix);
+    let app_folder_name = if channel == "nightly" {
+        "zed-custom.app".to_string()
+    } else {
+        format!("zed{suffix}.app")
+    };
 
     let from = extracted.join(&app_folder_name);
     let mut to = home_dir.join(".local");
@@ -1383,6 +1445,35 @@ mod tests {
     pub(super) struct InstallOverride(pub Rc<dyn Fn(&Path, &AsyncApp) -> Result<Option<PathBuf>>>);
     impl Global for InstallOverride {}
 
+    #[test]
+    fn github_release_selects_matching_asset_and_full_version() {
+        let release = serde_json::from_value(serde_json::json!({
+            "tag_name": "v1.23.0+nightly.42.0123456789abcdef0123456789abcdef01234567",
+            "prerelease": false,
+            "tarball_url": "https://example.com/source.tar.gz",
+            "zipball_url": "https://example.com/source.zip",
+            "assets": [
+                {
+                    "name": "Zed-aarch64.dmg",
+                    "browser_download_url": "https://example.com/Zed-aarch64.dmg"
+                },
+                {
+                    "name": "zed-remote-server-linux-x86_64.gz",
+                    "browser_download_url": "https://example.com/server.gz"
+                }
+            ]
+        }))
+        .expect("valid GitHub release");
+
+        let asset = release_asset_from_github(release, "zed-remote-server", "linux", "x86_64")
+            .expect("matching server asset");
+        assert_eq!(
+            asset.version,
+            "1.23.0+nightly.42.0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(asset.url, "https://example.com/server.gz");
+    }
+
     #[gpui::test]
     fn test_auto_update_defaults_to_true(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1408,6 +1499,7 @@ mod tests {
 
         cx.update(|cx| {
             settings::init(cx);
+            cx.set_global(db::AppDatabase::test_new());
 
             let current_version = semver::Version::new(0, 100, 0);
             release_channel::init_test(current_version, ReleaseChannel::Stable, cx);

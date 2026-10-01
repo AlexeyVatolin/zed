@@ -298,6 +298,15 @@ pub fn deploy_context_menu(
                 .action("Cut", Box::new(Cut))
                 .action("Copy", Box::new(Copy))
                 .action("Copy and Trim", Box::new(CopyAndTrim))
+                // Resolve Arc metadata only when an action is invoked, never while opening the menu.
+                .action(
+                    "Copy Arcadia Link to Trunk",
+                    Box::new(crate::actions::CopyArcadiaLinkToTrunk),
+                )
+                .action(
+                    "Copy Arcadia Link to Current Branch",
+                    Box::new(crate::actions::CopyArcadiaLinkToCurrentBranch),
+                )
                 .action("Paste", Box::new(Paste))
                 .separator()
                 .action_disabled_when(
@@ -370,6 +379,41 @@ mod tests {
         },
     };
     use indoc::indoc;
+
+    #[gpui::test]
+    async fn arcadia_menu_preserves_selection_and_clipboard(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("one\n«two\nthree\nˇ»four\n");
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".to_owned()))
+        });
+        cx.update_editor(|editor, window, cx| {
+            deploy_context_menu(
+                editor,
+                None,
+                DisplayPoint::new(crate::display_map::DisplayRow(1), 1),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.assert_editor_state("one\n«two\nthree\nˇ»four\n");
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Copy Arcadia Link to Trunk")
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Copy Arcadia Link to Current Branch")
+                .is_some()
+        );
+        cx.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("unchanged".to_owned())
+            )
+        });
+    }
 
     #[gpui::test]
     async fn test_mouse_context_menu(cx: &mut gpui::TestAppContext) {
