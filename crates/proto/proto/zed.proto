@@ -526,7 +526,8 @@ message Envelope {
     GetTerminalShell get_terminal_shell = 494;
     GetTerminalShellResponse get_terminal_shell_response = 495;
     GetArcadiaLink get_arcadia_link = 496;
-    GetArcadiaLinkResponse get_arcadia_link_response = 497; // current max
+    GetArcadiaLinkResponse get_arcadia_link_response = 497;
+    RefreshGitRepository refresh_git_repository = 498; // current max
   }
 
   reserved 87 to 88;

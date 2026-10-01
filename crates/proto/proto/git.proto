@@ -9,6 +9,11 @@ message GitBranchesResponse {
   optional string error = 2;
 }
 
+message RefreshGitRepository {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+}
+
 message UpdateDiffBases {
   uint64 project_id = 1;
   uint64 buffer_id = 2;

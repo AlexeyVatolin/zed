@@ -1048,6 +1048,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_push);
         client.add_entity_request_handler(Self::handle_pull);
         client.add_entity_request_handler(Self::handle_fetch);
+        client.add_entity_request_handler(Self::handle_refresh_git_repository);
         client.add_entity_request_handler(Self::handle_stage);
         client.add_entity_request_handler(Self::handle_unstage);
         client.add_entity_request_handler(Self::handle_stash);
@@ -3494,6 +3495,19 @@ impl GitStore {
         Ok(proto::GitCloneResponse {
             success: result.is_ok(),
         })
+    }
+
+    async fn handle_refresh_git_repository(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::RefreshGitRepository>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        repository
+            .update(&mut cx, |repository, cx| repository.refresh(cx))
+            .await??;
+        Ok(proto::Ack {})
     }
 
     async fn handle_fetch(
@@ -10120,6 +10134,58 @@ impl Repository {
         }
 
         self.pending_ops = updated;
+    }
+
+    /// Explicitly reloads Git state without relying on filesystem watcher events.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) -> oneshot::Receiver<Result<()>> {
+        let this = cx.weak_entity();
+        let id = self.id;
+        let updates_tx = self
+            .git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            });
+
+        // Keep explicit requests unkeyed: watcher scans may be coalesced, but a
+        // caller waiting for Refresh must not have its job skipped.
+        self.send_job(
+            "refresh",
+            Some("Refreshing Git state".into()),
+            move |state, mut cx| async move {
+                match state {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        let Some(this) = this.upgrade() else {
+                            return Ok(());
+                        };
+                        let snapshot = compute_snapshot(this.clone(), backend, &mut cx).await;
+                        this.update(&mut cx, |this, cx| {
+                            this.clear_pending_ops(cx);
+                            // A shim can return unchanged HEAD metadata even after a
+                            // commit, so reload open diffs regardless of HeadChanged.
+                            this.reload_buffer_diff_bases(cx);
+                        });
+                        if let Some(updates_tx) = updates_tx {
+                            updates_tx
+                                .unbounded_send(DownstreamUpdate::UpdateRepository(snapshot))
+                                .ok();
+                        }
+                        Ok(())
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        client
+                            .request(proto::RefreshGitRepository {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                            })
+                            .await?;
+                        Ok(())
+                    }
+                }
+            },
+        )
     }
 
     fn schedule_scan(

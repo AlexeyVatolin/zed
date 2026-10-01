@@ -4080,6 +4080,95 @@ async fn test_remote_git_diffs_when_recv_update_repository_delay(
 }
 
 #[gpui::test]
+async fn test_remote_git_refresh_without_watcher_event(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code/project1"),
+        json!({ ".git": {}, "file.txt": "new\n" }),
+    )
+    .await;
+    let git_dir = Path::new(path!("/code/project1/.git"));
+    fs.set_head_and_index_for_repo(git_dir, &[("file.txt", "old\n".into())]);
+
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    let repository = project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+    let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("file.txt")), cx)
+        })
+        .await
+        .unwrap();
+    let diff = project
+        .update(cx, |project, cx| {
+            project.open_uncommitted_diff(buffer.clone(), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        repository.read_with(cx, |repo, _| repo.cached_status().count()),
+        1
+    );
+    assert_eq!(
+        diff.read_with(cx, |diff, cx| diff.base_text_string(cx).unwrap()),
+        "old\n"
+    );
+
+    // Model an external commit with no watcher notification and no change in
+    // HEAD metadata. Both cached statuses and already-open diffs stay stale.
+    fs.with_git_state(git_dir, false, |state| {
+        state.head_contents.insert(
+            RepoPath::from_rel_path(rel_path("file.txt")),
+            b"new\n".to_vec(),
+        );
+        state.index_contents = state.head_contents.clone();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        repository.read_with(cx, |repo, _| repo.cached_status().count()),
+        1
+    );
+    assert_eq!(
+        diff.read_with(cx, |diff, cx| diff.base_text_string(cx).unwrap()),
+        "old\n"
+    );
+
+    repository
+        .update(cx, |repo, cx| repo.refresh(cx))
+        .await
+        .unwrap()
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        repository.read_with(cx, |repo, _| repo.cached_status().count()),
+        0
+    );
+    diff.read_with(cx, |diff, cx| {
+        assert_eq!(diff.base_text_string(cx).unwrap(), "new\n");
+        assert_eq!(
+            diff.secondary_diff()
+                .unwrap()
+                .read(cx)
+                .base_text_string(cx)
+                .unwrap(),
+            "new\n"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_remote_git_branches(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
