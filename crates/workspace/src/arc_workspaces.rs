@@ -122,12 +122,6 @@ project="$mount/$relative"
 [[ -d "$project" ]] || { echo "Project directory does not exist: $project" >&2; exit 1; }
 project="$(cd -- "$project" && pwd -P)"
 [[ "$project" == "$mount/"* ]] || { echo 'Project directory escapes the Arc mount' >&2; exit 1; }
-[[ ! -L "$project/.git" ]] || { echo '.git is a symbolic link' >&2; exit 1; }
-if [[ -e "$project/.git" ]]; then
-    [[ -d "$project/.git" ]] || { echo '.git exists but is not a directory' >&2; exit 1; }
-else
-    mkdir -- "$project/.git"
-fi
 printf '%s\n%s\n' "$mount" "$project"
 "#;
 
@@ -568,8 +562,9 @@ esac
     fn mounts_configured_path_and_reuses_existing_arc_mount() -> Result<()> {
         let fixture = ArcFixture::new()?;
         fixture.create()?;
-        assert!(fixture.mount().join("custom/project/.git").is_dir());
+        assert!(!fixture.mount().join("custom/project/.git").exists());
         fixture.create()?;
+        assert!(!fixture.mount().join("custom/project/.git").exists());
         let commands = std::fs::read_to_string(fixture.home.join("commands"))?;
         assert_eq!(
             commands
