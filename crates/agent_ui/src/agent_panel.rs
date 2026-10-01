@@ -1136,8 +1136,13 @@ pub struct AgentPanel {
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
+    herdr_install_in_progress: bool,
     #[cfg(test)]
     test_terminal_spawn_gate: Option<futures::channel::oneshot::Receiver<()>>,
+    #[cfg(test)]
+    test_herdr_session_names: std::collections::VecDeque<Result<std::collections::HashSet<String>>>,
+    #[cfg(test)]
+    test_herdr_install_command: Option<std::process::Command>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_panel_menu_handle: PopoverMenuHandle<ContextMenu>,
     _extension_subscription: Option<Subscription>,
@@ -1557,8 +1562,13 @@ impl AgentPanel {
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
+            herdr_install_in_progress: false,
             #[cfg(test)]
             test_terminal_spawn_gate: None,
+            #[cfg(test)]
+            test_herdr_session_names: Default::default(),
+            #[cfg(test)]
+            test_herdr_install_command: None,
             new_thread_menu_handle: PopoverMenuHandle::default(),
             agent_panel_menu_handle: PopoverMenuHandle::default(),
 
@@ -2054,6 +2064,10 @@ impl AgentPanel {
             return;
         }
 
+        if self.herdr_install_in_progress {
+            return;
+        }
+
         let Some(working_directory) = working_directory else {
             self.workspace
                 .update(cx, |workspace, cx| {
@@ -2089,12 +2103,13 @@ impl AgentPanel {
             .terminal_init_command
             .clone()
             .or_else(|| settings.terminal_herdr_default_agent.clone());
-        let list_command = herdr_terminal_thread::command(
-            self.project.clone(),
-            &["session".to_owned(), "list".to_owned(), "--json".to_owned()],
-            None,
-            cx,
-        );
+        let project = self.project.clone();
+        let host = project
+            .read(cx)
+            .remote_connection_options(cx)
+            .map(|options| options.display_name())
+            .unwrap_or_else(|| "this computer".to_owned());
+        let list_sessions = self.herdr_session_names(cx);
 
         self.pending_terminal_spawn = Some(terminal_id);
         let workspace = self.workspace.clone();
@@ -2103,19 +2118,78 @@ impl AgentPanel {
             .reload_task();
         cx.spawn_in(window, async move |this, cx| {
             reload_task.await;
-            let names = match list_command.await {
-                Ok(command) => {
-                    cx.background_spawn(async move {
-                        herdr_terminal_thread::session_names(&herdr_terminal_thread::run(command)?)
-                    })
-                    .await
-                }
-                Err(error) => Err(error),
-            };
+            let mut names = list_sessions.await.map(Some);
+            if names
+                .as_ref()
+                .is_err_and(|error| error.is::<herdr_terminal_thread::HerdrNotInstalled>())
+            {
+                let prompt = this.update_in(cx, |this, window, cx| {
+                    if this.pending_terminal_spawn != Some(terminal_id) || this.project != project {
+                        return None;
+                    }
+                    let detail = format!(
+                        "Herdr is not installed on {host}. Install it and open this terminal thread?\n\n{}\n\nhttps://herdr.dev/docs/install/",
+                        herdr_terminal_thread::INSTALL_COMMAND,
+                    );
+                    Some(window.prompt(
+                        gpui::PromptLevel::Info,
+                        "Install Herdr?",
+                        Some(&detail),
+                        &["Cancel", "Install"],
+                        cx,
+                    ))
+                })?;
+                let accepted = match prompt {
+                    Some(prompt) => prompt.await.ok() == Some(1),
+                    None => false,
+                };
+                names = if accepted {
+                    let install_command = this.update(cx, |this, cx| {
+                        if this.pending_terminal_spawn != Some(terminal_id) || this.project != project {
+                            return None;
+                        }
+                        this.herdr_install_in_progress = true;
+                        cx.notify();
+                        Some(this.herdr_install_command(cx))
+                    })?;
+                    if let Some(install_command) = install_command {
+                        struct InstallingHerdr;
+                        let toast_id = workspace::notifications::NotificationId::unique::<InstallingHerdr>();
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.show_toast(
+                                workspace::Toast::new(toast_id.clone(), format!("Installing Herdr on {host}…")),
+                                cx,
+                            );
+                        }).log_err();
+                        let result = async {
+                            let command = install_command.await?;
+                            cx.background_spawn(async move { herdr_terminal_thread::install(command) }).await?;
+                            let sessions = this.update(cx, |this, cx| {
+                                (this.pending_terminal_spawn == Some(terminal_id) && this.project == project)
+                                    .then(|| this.herdr_session_names(cx))
+                            })?;
+                            match sessions {
+                                Some(sessions) => sessions.await.map(Some),
+                                None => Ok(None),
+                            }
+                        }.await;
+                        workspace.update(cx, |workspace, cx| workspace.dismiss_toast(&toast_id, cx)).log_err();
+                        this.update(cx, |this, cx| {
+                            this.herdr_install_in_progress = false;
+                            cx.notify();
+                        })?;
+                        result
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                };
+            }
             match names {
-                Ok(names) => {
+                Ok(Some(names)) => {
                     this.update_in(cx, |this, window, cx| {
-                        if this.pending_terminal_spawn != Some(terminal_id) {
+                        if this.pending_terminal_spawn != Some(terminal_id) || this.project != project {
                             return;
                         }
                         let mut occupied = names;
@@ -2171,6 +2245,14 @@ impl AgentPanel {
                         );
                     })?;
                 }
+                Ok(None) => {
+                    this.update(cx, |this, cx| {
+                        if this.pending_terminal_spawn == Some(terminal_id) {
+                            this.pending_terminal_spawn = None;
+                            cx.notify();
+                        }
+                    })?;
+                }
                 Err(error) => {
                     workspace.update(cx, |workspace, cx| workspace.show_error(error, cx))?;
                     this.update(cx, |this, cx| {
@@ -2184,6 +2266,28 @@ impl AgentPanel {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    fn herdr_session_names(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<std::collections::HashSet<String>>> {
+        #[cfg(test)]
+        if let Some(result) = self.test_herdr_session_names.pop_front() {
+            return Task::ready(result);
+        }
+        herdr_terminal_thread::list_sessions(self.project.clone(), cx)
+    }
+
+    fn herdr_install_command(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<std::process::Command>> {
+        #[cfg(test)]
+        if let Some(command) = self.test_herdr_install_command.take() {
+            return Task::ready(Ok(command));
+        }
+        herdr_terminal_thread::install_command(self.project.clone(), cx)
     }
 
     fn terminal_working_directory(
@@ -2252,7 +2356,7 @@ impl AgentPanel {
         });
         let init_command = herdr_session
             .as_ref()
-            .map(HerdrTerminalSession::attach_command)
+            .map(|session| session.attach_command(self.project.read(cx).path_style(cx)))
             .or_else(|| Self::terminal_init_command(run_init_command, cx));
         let terminal_task = self.create_terminal_shell(working_directory, cx);
         let workspace = self.workspace.clone();
@@ -9880,6 +9984,178 @@ mod tests {
         });
 
         (panel, cx)
+    }
+
+    #[cfg(unix)]
+    fn prepare_herdr_install_test(
+        panel: &Entity<AgentPanel>,
+        cx: &mut VisualTestContext,
+        fail: bool,
+    ) -> tempfile::TempDir {
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                if fail {
+                    "echo 'installer failed' >&2; exit 1"
+                } else {
+                    "printf installed > \"$1\""
+                },
+                "test-installer",
+            ])
+            .arg(directory.path().join("installed"));
+        panel.update(cx, |panel, _| {
+            panel
+                .test_herdr_session_names
+                .push_back(Err(herdr_terminal_thread::HerdrNotInstalled.into()));
+            panel
+                .test_herdr_session_names
+                .push_back(Ok(Default::default()));
+            panel.test_herdr_install_command = Some(command);
+        });
+        directory
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_herdr_install_cancel_does_not_install_or_create_thread(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let directory = prepare_herdr_install_test(&panel, &mut cx, false);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.new_herdr_terminal(None, AgentThreadSource::AgentPanel, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        let (_, detail) = cx.pending_prompt().unwrap();
+        assert!(detail.contains(herdr_terminal_thread::INSTALL_COMMAND));
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert!(!directory.path().join("installed").exists());
+        panel.read_with(&cx, |panel, _| {
+            assert!(panel.test_herdr_install_command.is_some());
+            assert!(panel.pending_terminal_spawn.is_none());
+            assert!(panel.terminals.is_empty());
+        });
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_herdr_install_accept_creates_requested_thread(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (panel, mut cx) = setup_panel(cx).await;
+        let directory = prepare_herdr_install_test(&panel, &mut cx, false);
+        // Exercise the documented pipeline without downloading or installing Herdr.
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let curl = bin.join("curl");
+        std::fs::write(
+            &curl,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/curl-args\"\nprintf 'printf installed > \"$HOME/installed\"\\n'\n",
+        ).unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut installer = panel
+            .update(&mut cx, |panel, cx| {
+                herdr_terminal_thread::install_command(panel.project.clone(), cx)
+            })
+            .await
+            .unwrap();
+        installer
+            .env("HOME", directory.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        panel.update(&mut cx, |panel, _| {
+            panel.test_herdr_install_command = Some(installer)
+        });
+        let (release, gate) = futures::channel::oneshot::channel();
+        let terminal_id = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.test_terminal_spawn_gate = Some(gate);
+            panel.new_herdr_terminal(None, AgentThreadSource::AgentPanel, window, cx);
+            panel.pending_terminal_spawn.unwrap()
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Install");
+        cx.run_until_parked();
+        assert!(directory.path().join("installed").exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("curl-args")).unwrap(),
+            "-fsSL\nhttps://herdr.dev/install.sh\n"
+        );
+        panel.read_with(&cx, |panel, cx| {
+            assert!(!panel.herdr_install_in_progress);
+            let store = TerminalThreadMetadataStore::global(cx).read(cx);
+            assert!(store.entry(terminal_id).unwrap().herdr_session.is_some());
+        });
+        release.send(()).unwrap();
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, _| {
+            assert!(panel.terminals.contains_key(&terminal_id))
+        });
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_herdr_install_failure_clears_pending_thread(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let directory = prepare_herdr_install_test(&panel, &mut cx, true);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.new_herdr_terminal(None, AgentThreadSource::AgentPanel, window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Install");
+        cx.run_until_parked();
+        assert!(!directory.path().join("installed").exists());
+        panel.read_with(&cx, |panel, _| {
+            assert!(!panel.herdr_install_in_progress);
+            assert!(panel.pending_terminal_spawn.is_none());
+            assert!(panel.terminals.is_empty());
+        });
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_herdr_runtime_error_does_not_offer_install(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let directory = prepare_herdr_install_test(&panel, &mut cx, false);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.test_herdr_session_names.clear();
+            panel
+                .test_herdr_session_names
+                .push_back(Err(anyhow!("Herdr server failed")));
+            panel.new_herdr_terminal(None, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert!(!directory.path().join("installed").exists());
+        panel.read_with(&cx, |panel, _| {
+            assert!(panel.test_herdr_install_command.is_some())
+        });
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_herdr_stale_install_approval_does_not_install(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let directory = prepare_herdr_install_test(&panel, &mut cx, false);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.new_herdr_terminal(None, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        let (release, gate) = futures::channel::oneshot::channel();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.test_terminal_spawn_gate = Some(gate);
+            panel.new_terminal(None, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.simulate_prompt_answer("Install");
+        cx.run_until_parked();
+        assert!(!directory.path().join("installed").exists());
+        panel.read_with(&cx, |panel, _| {
+            assert!(panel.test_herdr_install_command.is_some());
+        });
+        release.send(()).unwrap();
+        cx.run_until_parked();
     }
 
     async fn setup_visible_panel(

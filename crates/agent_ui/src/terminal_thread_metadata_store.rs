@@ -773,7 +773,7 @@ mod tests {
             restored[0].display_title().as_ref(),
             "Investigate failing tests"
         );
-        assert_eq!(restored[0].icon(), IconName::AiOpenAi);
+        assert_eq!(restored[0].icon(), IconName::Herdr);
     }
 
     #[gpui::test]

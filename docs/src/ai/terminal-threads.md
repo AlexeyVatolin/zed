@@ -54,7 +54,15 @@ For a custom shell command, set `agent.terminal_init_command` in the Settings Ed
 
 ## Persistent Herdr Sessions {#persistent-herdr-sessions}
 
-If [Herdr](https://herdr.dev/) is installed on the host that runs the terminal, choose **Herdr Terminal Thread** from the new thread menu, or press **⌘⌥N** on macOS. This action always creates a named Herdr session, regardless of which agent type you created last. **Terminal** in the same menu always creates a regular terminal.
+Choose **Herdr Terminal Thread** from the new thread menu, or press {#kb agent::NewHerdrTerminalThread}. This action always creates a named [Herdr](https://herdr.dev/) session, regardless of which agent type you created last. **Terminal** in the same menu always creates a regular terminal.
+
+On macOS and Linux, if Herdr is missing from the host that runs the terminal, Zed offers to install it. Choose **Install** to run the command from [Herdr's installation guide](https://herdr.dev/docs/install/):
+
+```sh
+curl -fsSL https://herdr.dev/install.sh | sh
+```
+
+For an SSH project, installation runs on the remote host. Zed opens the requested thread after installation succeeds. Choose **Cancel** to leave Herdr uninstalled. Zed also finds Herdr in the installer's default `~/.local/bin` folder without restarting the window.
 
 To make the default new thread action use Herdr when the last created agent type was a terminal, set:
 
