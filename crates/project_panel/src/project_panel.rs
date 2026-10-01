@@ -1176,6 +1176,15 @@ impl ProjectPanel {
                 (has_git_repo, has_history)
             };
 
+            let managed_arc_workspace = is_root
+                && project.remote_client().is_some_and(|client| {
+                    workspace::arc_workspaces::managed_workspace(
+                        &client.read(cx).connection_options(),
+                        &worktree.abs_path(),
+                        cx,
+                    )
+                    .is_some()
+                });
             let has_pasteable_content = self.has_pasteable_content(cx);
             let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
                 menu.context(self.focus_handle.clone()).map(|menu| {
@@ -1281,7 +1290,14 @@ impl ProjectPanel {
                                         "Add Folders to Project…",
                                         Box::new(workspace::AddFolderToProject),
                                     )
-                                    .action("Remove from Project", Box::new(RemoveFromProject))
+                                    .action(
+                                        if managed_arc_workspace {
+                                            "Delete Arc Workspace…"
+                                        } else {
+                                            "Remove from Project"
+                                        },
+                                        Box::new(RemoveFromProject),
+                                    )
                             })
                             .when(is_dir && !is_root, |menu| {
                                 menu.separator()
@@ -4053,13 +4069,31 @@ impl ProjectPanel {
     fn remove_from_project(
         &mut self,
         _: &RemoveFromProject,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        for entry in self.effective_entries().iter() {
-            let worktree_id = entry.worktree_id;
-            self.project
-                .update(cx, |project, cx| project.remove_worktree(worktree_id, cx));
+        let mut ids: Vec<_> = self
+            .effective_entries()
+            .iter()
+            .map(|entry| entry.worktree_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let fs = self.fs.clone();
+        for worktree_id in ids {
+            workspace::arc_workspaces::remove_open_folder(
+                self.project.clone(),
+                worktree_id,
+                fs.clone(),
+                window,
+                cx,
+            )
+            .detach_and_prompt_err(
+                "Failed to delete Arc workspace",
+                window,
+                cx,
+                |_, _, _| None,
+            );
         }
     }
 

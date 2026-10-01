@@ -62,8 +62,21 @@ message DirectoryEnvironment {
 message GetTerminalShell {
   uint64 project_id = 1;
   optional uint64 worktree_id = 2;
+  optional string terminal_thread_id = 3;
 }
 
 message GetTerminalShellResponse {
   Shell shell = 1;
+  map<string, string> agent_environment = 2;
+}
+
+message TerminalAgentSessionUpdated {
+  uint64 project_id = 1;
+  string terminal_thread_id = 2;
+  optional string session = 3;
+}
+
+message CloseTerminalAgentIntegration {
+  uint64 project_id = 1;
+  string terminal_thread_id = 2;
 }

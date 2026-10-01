@@ -625,6 +625,8 @@ impl EditorElement {
         register_action(editor, window, Editor::copy_file_name_without_extension);
         register_action(editor, window, Editor::copy_highlight_json);
         register_action(editor, window, Editor::copy_permalink_to_line);
+        register_action(editor, window, Editor::copy_arcadia_link_to_trunk);
+        register_action(editor, window, Editor::copy_arcadia_link_to_current_branch);
         register_action(editor, window, Editor::open_permalink_to_line);
         register_action(editor, window, Editor::copy_file_location);
         register_action(editor, window, Editor::toggle_git_blame);

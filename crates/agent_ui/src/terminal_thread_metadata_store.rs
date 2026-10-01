@@ -13,11 +13,13 @@ use db::{
 use futures::{FutureExt, future::Shared};
 use gpui::{AppContext as _, Entity, Global, Task};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
-use ui::{App, Context, SharedString};
+use ui::{App, Context, IconName, SharedString};
 use util::ResultExt as _;
 use workspace::PathList;
 
-use crate::{TerminalId, thread_metadata_store::WorktreePaths};
+use crate::{
+    TerminalId, herdr_terminal_thread::HerdrTerminalSession, thread_metadata_store::WorktreePaths,
+};
 
 pub fn init(cx: &mut App) {
     TerminalThreadMetadataStore::init_global(cx);
@@ -53,6 +55,8 @@ pub struct TerminalThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub working_directory: Option<PathBuf>,
+    pub herdr_session: Option<HerdrTerminalSession>,
+    pub agent_session: Option<util::terminal_agent::TerminalAgentSession>,
 }
 
 impl TerminalThreadMetadata {
@@ -65,6 +69,12 @@ impl TerminalThreadMetadata {
     }
 
     pub fn display_title(&self) -> SharedString {
+        if let Some(session) = &self.herdr_session {
+            return self
+                .custom_title
+                .clone()
+                .unwrap_or_else(|| session.display_title().to_owned().into());
+        }
         compose_terminal_thread_title(
             self.title.as_ref(),
             self.custom_title.as_ref().map(|title| title.as_ref()),
@@ -72,9 +82,21 @@ impl TerminalThreadMetadata {
     }
 
     pub fn editable_title(&self) -> SharedString {
+        if let Some(session) = &self.herdr_session {
+            return self
+                .custom_title
+                .clone()
+                .unwrap_or_else(|| session.display_title().to_owned().into());
+        }
         self.custom_title.clone().unwrap_or_else(|| {
             SharedString::from(terminal_title_without_prefix(self.title.as_ref()).to_string())
         })
+    }
+
+    pub fn icon(&self) -> IconName {
+        self.herdr_session
+            .as_ref()
+            .map_or(IconName::Terminal, HerdrTerminalSession::icon)
     }
 }
 
@@ -483,20 +505,26 @@ struct TerminalThreadMetadataDb(ThreadSafeConnection);
 impl Domain for TerminalThreadMetadataDb {
     const NAME: &str = stringify!(TerminalThreadMetadataDb);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
-            terminal_id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            custom_title TEXT,
-            created_at TEXT NOT NULL,
-            working_directory TEXT,
-            folder_paths TEXT,
-            folder_paths_order TEXT,
-            main_worktree_paths TEXT,
-            main_worktree_paths_order TEXT,
-            remote_connection TEXT
-        ) STRICT;
-    )];
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
+                terminal_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                custom_title TEXT,
+                created_at TEXT NOT NULL,
+                working_directory TEXT,
+                folder_paths TEXT,
+                folder_paths_order TEXT,
+                main_worktree_paths TEXT,
+                main_worktree_paths_order TEXT,
+                remote_connection TEXT
+            ) STRICT;
+        ),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads ADD COLUMN herdr_session TEXT;
+        ),
+        sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN agent_session TEXT;),
+    ];
 }
 
 db::static_connection!(TerminalThreadMetadataDb, []);
@@ -506,7 +534,7 @@ impl TerminalThreadMetadataDb {
         self.select::<TerminalThreadMetadata>(
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-            main_worktree_paths_order, remote_connection \
+            main_worktree_paths_order, remote_connection, herdr_session, agent_session \
             FROM sidebar_terminal_threads \
             ORDER BY created_at DESC",
         )?()
@@ -540,10 +568,22 @@ impl TerminalThreadMetadataDb {
             .map(serde_json::to_string)
             .transpose()
             .context("serialize terminal thread remote connection")?;
+        let herdr_session = row
+            .herdr_session
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize Herdr terminal session")?;
+
+        let agent_session = row
+            .agent_session
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, herdr_session, agent_session) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -553,7 +593,9 @@ impl TerminalThreadMetadataDb {
                            folder_paths_order = excluded.folder_paths_order, \
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
-                           remote_connection = excluded.remote_connection";
+                           remote_connection = excluded.remote_connection, \
+                           herdr_session = excluded.herdr_session, \
+                           agent_session = excluded.agent_session";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -564,7 +606,9 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&folder_paths_order, i)?;
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
-            stmt.bind(&remote_connection, i)?;
+            i = stmt.bind(&remote_connection, i)?;
+            i = stmt.bind(&herdr_session, i)?;
+            stmt.bind(&agent_session, i)?;
             stmt.exec()
         })
         .await
@@ -600,6 +644,12 @@ impl Column for TerminalThreadMetadata {
             Column::column(statement, next)?;
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
+        let (herdr_session_json, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (agent_session_json, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let agent_session = agent_session_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -624,6 +674,11 @@ impl Column for TerminalThreadMetadata {
             .map(serde_json::from_str::<RemoteConnectionOptions>)
             .transpose()
             .context("deserialize terminal thread remote connection")?;
+        let herdr_session = herdr_session_json
+            .as_deref()
+            .map(serde_json::from_str::<HerdrTerminalSession>)
+            .transpose()
+            .context("deserialize Herdr terminal session")?;
 
         let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
             .unwrap_or_else(|_| WorktreePaths::default());
@@ -639,6 +694,8 @@ impl Column for TerminalThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 working_directory: working_directory.map(PathBuf::from),
+                herdr_session,
+                agent_session,
             },
             next,
         ))
@@ -648,6 +705,7 @@ impl Column for TerminalThreadMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::herdr_terminal_thread::HerdrAgentSession;
     use gpui::TestAppContext;
     use std::path::Path;
 
@@ -668,6 +726,8 @@ mod tests {
             worktree_paths,
             remote_connection: None,
             working_directory: None,
+            herdr_session: None,
+            agent_session: None,
         }
     }
 
@@ -695,6 +755,87 @@ mod tests {
 
         metadata.title = "Thinking".into();
         assert_eq!(metadata.display_title().as_ref(), "Fix bug");
+    }
+
+    #[gpui::test]
+    async fn test_agent_session_identity_round_trips_in_database(cx: &mut TestAppContext) {
+        cx.update(init);
+        let database = cx.update(|cx| TerminalThreadMetadataStore::global(cx).read(cx).db.clone());
+        for (agent, session_id) in [
+            (
+                util::terminal_agent::TerminalAgent::Claude,
+                Some(uuid::Uuid::new_v4().to_string()),
+            ),
+            (
+                util::terminal_agent::TerminalAgent::Codex,
+                Some(uuid::Uuid::new_v4().to_string()),
+            ),
+            (util::terminal_agent::TerminalAgent::Codex, None),
+        ] {
+            let mut metadata = metadata("Agent", WorktreePaths::default());
+            metadata.agent_session = Some(util::terminal_agent::TerminalAgentSession {
+                agent,
+                session_id,
+                working_directory: "/remote/project".into(),
+            });
+            database.save(metadata.clone()).await.unwrap();
+            let restored = database
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.terminal_id == metadata.terminal_id)
+                .unwrap();
+            assert_eq!(restored.agent_session, metadata.agent_session);
+            assert_eq!(restored.icon(), IconName::Terminal);
+            metadata.agent_session = None;
+            database.save(metadata.clone()).await.unwrap();
+            assert!(
+                database
+                    .list()
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.terminal_id == metadata.terminal_id)
+                    .unwrap()
+                    .agent_session
+                    .is_none()
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_herdr_session_identity_round_trips_in_database(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut metadata = metadata(
+            "workspace",
+            WorktreePaths::from_folder_paths(&PathList::default()),
+        );
+        metadata.herdr_session = Some(HerdrTerminalSession {
+            name: "workspace-2".to_owned(),
+            agent: Some("codex".to_owned()),
+            agent_session: Some(HerdrAgentSession {
+                source: "herdr:codex".to_owned(),
+                agent: "codex".to_owned(),
+                kind: "id".to_owned(),
+                value: "session-after-switch".to_owned(),
+            }),
+            current_title: Some("Investigate failing tests".to_owned()),
+            is_working: true,
+            initial_command: Some("codex".to_owned()),
+            initial_command_sent: true,
+        });
+        let database = cx.update(|cx| TerminalThreadMetadataStore::global(cx).read(cx).db.clone());
+        database
+            .save(metadata.clone())
+            .await
+            .expect("save Herdr metadata");
+        let restored = database.list().expect("load Herdr metadata");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].herdr_session, metadata.herdr_session);
+        assert_eq!(
+            restored[0].display_title().as_ref(),
+            "Investigate failing tests"
+        );
+        assert_eq!(restored[0].icon(), IconName::Herdr);
     }
 
     #[gpui::test]

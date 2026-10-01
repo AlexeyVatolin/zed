@@ -849,6 +849,104 @@ async fn test_remote_project_search_reports_untitled_buffer_once(
     assert_eq!(result_buffers.len(), 2);
 }
 
+#[cfg(unix)]
+#[gpui::test]
+async fn test_remote_terminal_agent_session_notifications(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    // Unix socket readiness is delivered by the OS reactor.
+    cx.executor().allow_parking();
+    server_cx.executor().allow_parking();
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let terminal_thread_id = uuid::Uuid::new_v4().to_string();
+    let request = project.read_with(cx, |project, cx| {
+        project
+            .remote_client()
+            .unwrap()
+            .read(cx)
+            .proto_client()
+            .request(proto::GetTerminalShell {
+                project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                worktree_id: None,
+                terminal_thread_id: Some(terminal_thread_id.clone()),
+            })
+    });
+    let response = request.await.unwrap();
+    let socket = response
+        .agent_environment
+        .get("ZED_TERMINAL_AGENT_SOCKET")
+        .unwrap();
+    let session = util::terminal_agent::TerminalAgentSession {
+        agent: util::terminal_agent::TerminalAgent::Codex,
+        session_id: None,
+        working_directory: "/remote/project".into(),
+    };
+    let payload =
+        serde_json::to_vec(&json!({ "event": "started", "launch": "launch", "session": session }))
+            .unwrap();
+    use std::io::Write as _;
+    let mut connection = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    connection.write_all(&payload).unwrap();
+    drop(connection);
+    cx.condition(&project, |project, _| {
+        project
+            .terminal_agent_session(&terminal_thread_id)
+            .is_some()
+    })
+    .await;
+    project.read_with(cx, |project, _| {
+        assert_eq!(
+            project.terminal_agent_session(&terminal_thread_id),
+            Some(&session)
+        )
+    });
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut connection = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    serde_json::to_writer(
+        &mut connection,
+        &json!({ "event": "session", "launch": "launch", "session_id": session_id }),
+    )
+    .unwrap();
+    drop(connection);
+    cx.condition(&project, |project, _| {
+        project
+            .terminal_agent_session(&terminal_thread_id)
+            .is_some_and(|session| session.session_id.as_ref() == Some(&session_id))
+    })
+    .await;
+    let mut connection = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    serde_json::to_writer(
+        &mut connection,
+        &json!({ "event": "exited", "launch": "launch" }),
+    )
+    .unwrap();
+    drop(connection);
+    cx.condition(&project, |project, _| {
+        project
+            .terminal_agent_session(&terminal_thread_id)
+            .is_none()
+    })
+    .await;
+    project
+        .read_with(cx, |project, cx| {
+            project
+                .remote_client()
+                .unwrap()
+                .read(cx)
+                .proto_client()
+                .send(proto::CloseTerminalAgentIntegration {
+                    project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                    terminal_thread_id,
+                })
+        })
+        .unwrap();
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    assert!(!std::path::Path::new(socket).exists());
+}
+
 #[gpui::test]
 async fn test_remote_settings(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
@@ -922,6 +1020,7 @@ async fn test_remote_settings(cx: &mut TestAppContext, server_cx: &mut TestAppCo
                 remote_client
                     .proto_client()
                     .request(proto::GetTerminalShell {
+                        terminal_thread_id: None,
                         project_id: proto::REMOTE_SERVER_PROJECT_ID,
                         worktree_id: None,
                     })
@@ -4080,6 +4179,95 @@ async fn test_remote_git_diffs_when_recv_update_repository_delay(
 }
 
 #[gpui::test]
+async fn test_remote_git_refresh_without_watcher_event(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code/project1"),
+        json!({ ".git": {}, "file.txt": "new\n" }),
+    )
+    .await;
+    let git_dir = Path::new(path!("/code/project1/.git"));
+    fs.set_head_and_index_for_repo(git_dir, &[("file.txt", "old\n".into())]);
+
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    let repository = project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+    let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("file.txt")), cx)
+        })
+        .await
+        .unwrap();
+    let diff = project
+        .update(cx, |project, cx| {
+            project.open_uncommitted_diff(buffer.clone(), cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        repository.read_with(cx, |repo, _| repo.cached_status().count()),
+        1
+    );
+    assert_eq!(
+        diff.read_with(cx, |diff, cx| diff.base_text_string(cx).unwrap()),
+        "old\n"
+    );
+
+    // Model an external commit with no watcher notification and no change in
+    // HEAD metadata. Both cached statuses and already-open diffs stay stale.
+    fs.with_git_state(git_dir, false, |state| {
+        state.head_contents.insert(
+            RepoPath::from_rel_path(rel_path("file.txt")),
+            b"new\n".to_vec(),
+        );
+        state.index_contents = state.head_contents.clone();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        repository.read_with(cx, |repo, _| repo.cached_status().count()),
+        1
+    );
+    assert_eq!(
+        diff.read_with(cx, |diff, cx| diff.base_text_string(cx).unwrap()),
+        "old\n"
+    );
+
+    repository
+        .update(cx, |repo, cx| repo.refresh(cx))
+        .await
+        .unwrap()
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        repository.read_with(cx, |repo, _| repo.cached_status().count()),
+        0
+    );
+    diff.read_with(cx, |diff, cx| {
+        assert_eq!(diff.base_text_string(cx).unwrap(), "new\n");
+        assert_eq!(
+            diff.secondary_diff()
+                .unwrap()
+                .read(cx)
+                .base_text_string(cx)
+                .unwrap(),
+            "new\n"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_remote_git_branches(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
@@ -4887,6 +5075,407 @@ async fn test_remote_lsp_show_document(cx: &mut TestAppContext, server_cx: &mut 
         .expect("show document request should not error");
     assert_eq!(response, lsp::ShowDocumentResult { success: true });
     assert_eq!(handled_requests.load(Ordering::Acquire), 1);
+}
+
+#[gpui::test]
+async fn file_finder_opens_remote_absolute_path_outside_project(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    cx.update(|cx| {
+        let settings = SettingsStore::test(cx);
+        cx.set_global(settings);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+        file_finder::init(cx);
+    });
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/project"), json!({ "known.txt": "known" }))
+        .await;
+    fs.insert_tree(
+        path!("/outside"),
+        json!({ "external.txt": "first\nsecond\nthird" }),
+    )
+    .await;
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/project"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    let window = cx
+        .add_window(|window, cx| workspace::MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let mut visual_cx = gpui::VisualTestContext::from_window(window.into(), cx);
+    visual_cx.dispatch_action(workspace::ToggleFileFinder {
+        separate_history: true,
+        include_ignored: None,
+    });
+    visual_cx.run_until_parked();
+    visual_cx.read(|cx| {
+        assert!(
+            workspace
+                .read(cx)
+                .active_modal::<file_finder::FileFinder>(cx)
+                .is_some()
+        )
+    });
+    let metadata_calls = fs.metadata_call_count();
+    visual_cx.simulate_input(&format!("{}:2:3", path!("/outside/external.txt")));
+    visual_cx
+        .executor()
+        .advance_clock(std::time::Duration::from_millis(300));
+    visual_cx.run_until_parked();
+    assert_eq!(
+        fs.metadata_call_count(),
+        metadata_calls + 1,
+        "external lookup must use one server metadata request"
+    );
+    visual_cx.read(|cx| {
+        assert_eq!(
+            project.read(cx).worktrees(cx).count(),
+            1,
+            "querying must not register a worktree"
+        );
+    });
+    visual_cx.dispatch_action(menu::Confirm);
+    visual_cx.run_until_parked();
+    visual_cx.update(|_, cx| {
+        let editor = workspace
+            .read(cx)
+            .active_item_as::<Editor>(cx)
+            .expect("external file opened");
+        assert_eq!(editor.read(cx).text(cx), "first\nsecond\nthird");
+        editor.update(cx, |editor, cx| {
+            assert_eq!(
+                editor
+                    .selections
+                    .newest::<Point>(&editor.display_snapshot(cx))
+                    .head(),
+                Point::new(1, 2)
+            );
+        });
+        let worktree = project
+            .read(cx)
+            .find_worktree(Path::new(path!("/outside/external.txt")), cx)
+            .unwrap()
+            .0;
+        assert!(worktree.read(cx).is_single_file());
+        assert!(!worktree.read(cx).is_visible());
+        assert_eq!(project.read(cx).visible_worktrees(cx).count(), 1);
+    });
+    server_cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn terminal_relative_links_resolve_unscanned_remote_files(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    cx.update(|cx| {
+        let settings = SettingsStore::test(cx);
+        cx.set_global(settings);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+    });
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/project"), json!({ "src": { "known.rs": "known" } }))
+        .await;
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/project"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    fs.pause_events();
+    fs.insert_tree(path!("/project/generated"), json!({ "later.rs": "new" }))
+        .await;
+    assert!(worktree.read_with(cx, |worktree, _| {
+        worktree
+            .entry_for_path(rel_path("generated/later.rs"))
+            .is_none()
+    }));
+
+    let visual_cx = cx.add_empty_window();
+    let workspace = visual_cx
+        .new_window_entity(|window, cx| workspace::Workspace::test_new(project, window, cx));
+    let metadata_calls = fs.metadata_call_count();
+    let cached = visual_cx
+        .update(|_, cx| {
+            workspace::path_link::resolve_open_target(
+                &workspace.downgrade(),
+                workspace::path_link::PathMatching::Heuristic,
+                "src/known.rs",
+                None,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        cached.path().path,
+        Path::new(path!("/project/src/known.rs"))
+    );
+    assert_eq!(
+        fs.metadata_call_count(),
+        metadata_calls,
+        "known paths must not send metadata requests"
+    );
+
+    let resolved = visual_cx
+        .update(|_, cx| {
+            workspace::path_link::resolve_open_target(
+                &workspace.downgrade(),
+                workspace::path_link::PathMatching::Heuristic,
+                "./generated/later.rs",
+                None,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.path().path,
+        Path::new(path!("/project/generated/later.rs"))
+    );
+    assert_eq!(
+        fs.metadata_call_count(),
+        metadata_calls + 1,
+        "normalized candidates must use only one metadata request"
+    );
+    let located = visual_cx
+        .update(|_, cx| {
+            workspace::path_link::resolve_open_target(
+                &workspace.downgrade(),
+                workspace::path_link::PathMatching::Heuristic,
+                "generated/later.rs:2:3",
+                None,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(located.path().path, resolved.path().path);
+    assert_eq!(located.path().row, Some(2));
+    assert_eq!(located.path().column, Some(3));
+
+    #[cfg(not(windows))]
+    {
+        fs.insert_tree(
+            path!("/project/data"),
+            json!({ "crawler_switch_eligible_results.md": "report" }),
+        )
+        .await;
+        let metadata_calls = fs.metadata_call_count();
+        let escaped = visual_cx
+            .update(|_, cx| {
+                workspace::path_link::resolve_open_target(
+                    &workspace.downgrade(),
+                    workspace::path_link::PathMatching::Heuristic,
+                    r"data/crawler\_switch\_eligible\_results.md",
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            escaped.path().path,
+            Path::new(path!("/project/data/crawler_switch_eligible_results.md"))
+        );
+        assert_eq!(
+            fs.metadata_call_count(),
+            metadata_calls + 2,
+            "check the literal path before the decoded path"
+        );
+        let positioned = visual_cx
+            .update(|_, cx| {
+                workspace::path_link::resolve_open_target(
+                    &workspace.downgrade(),
+                    workspace::path_link::PathMatching::Heuristic,
+                    r"data/crawler\_switch\_eligible\_results.md:2:3",
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(positioned.path().path, escaped.path().path);
+        assert_eq!(positioned.path().row, Some(2));
+        assert_eq!(positioned.path().column, Some(3));
+        let exact = visual_cx
+            .update(|_, cx| {
+                workspace::path_link::resolve_open_target(
+                    &workspace.downgrade(),
+                    workspace::path_link::PathMatching::Exact,
+                    r"data/crawler\_switch\_eligible\_results.md",
+                    None,
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            exact.is_none(),
+            "document links must preserve their exact path"
+        );
+    }
+}
+
+#[gpui::test]
+async fn arcadia_remote_request_returns_url_without_touching_server_clipboard(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    cx.update(|cx| {
+        let settings = SettingsStore::test(cx);
+        cx.set_global(settings);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+        editor::init(cx);
+    });
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    let (opts, session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+    let server = server_cx.new(|_| ());
+    session.add_request_handler(
+        server.downgrade(),
+        |_, _: client::TypedEnvelope<proto::Ping>, _| async { Ok(proto::Ack {}) },
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = calls.clone();
+    session.add_request_handler(
+        server.downgrade(),
+        move |_, request: client::TypedEnvelope<proto::GetArcadiaLink>, _| {
+            handler_calls.fetch_add(1, Ordering::Relaxed);
+            async move {
+                assert_eq!(request.payload.project_id, proto::REMOTE_SERVER_PROJECT_ID);
+                assert_eq!(request.payload.path.unwrap().path, "src/lib.rs");
+                assert_eq!((request.payload.start_row, request.payload.end_row), (2, 5));
+                let revision = if request.payload.current_branch {
+                    "users%2Ftest%2Ffeature"
+                } else {
+                    "trunk"
+                };
+                Ok(proto::GetArcadiaLinkResponse {
+                    url: format!("https://a.yandex-team.ru/arcadia/src/lib.rs?rev={revision}#L3-6"),
+                })
+            }
+        },
+    );
+    server_cx.update(|cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "server clipboard".to_owned(),
+        ))
+    });
+    drop(connect_guard);
+    let ssh = RemoteClient::connect_mock(opts, cx).await;
+    let project = build_project(ssh, cx);
+    for current_branch in [false, true] {
+        let url = project
+            .update(cx, |project, cx| {
+                project.get_arcadia_link(
+                    ProjectPath {
+                        worktree_id: worktree::WorktreeId::from_proto(1),
+                        path: rel_path("src/lib.rs").into(),
+                    },
+                    2,
+                    5,
+                    current_branch,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(url.ends_with("#L3-6"));
+        assert!(url.contains(if current_branch {
+            "rev=users%2Ftest%2Ffeature"
+        } else {
+            "rev=trunk"
+        }));
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    let worktree = project.update(cx, |project, cx| {
+        project.add_test_remote_worktree("/arcadia", cx)
+    });
+    let buffer = cx.new(|cx| {
+        let mut buffer = Buffer::local("one\ntwo\nthree\nfour\nfive\nsix\nseven\n", cx);
+        buffer.file_updated(
+            Arc::new(project::File {
+                worktree,
+                path: rel_path("src/lib.rs").into(),
+                disk_state: language::DiskState::New,
+                entry_id: None,
+                is_local: false,
+                is_private: false,
+            }),
+            cx,
+        );
+        buffer
+    });
+    let window = cx.add_window(|window, cx| Editor::for_buffer(buffer, Some(project), window, cx));
+    let editor = window.root(cx).unwrap();
+    let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+    editor.update_in(cx, |editor, window, cx| {
+        editor.change_selections(SelectionEffects::default(), window, cx, |s| {
+            s.select_ranges([Point::new(2, 0)..Point::new(6, 0)]);
+        });
+        editor.open_context_menu(&editor::actions::OpenContextMenu, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "opening the menu must not request an Arcadia link"
+    );
+    assert!(
+        cx.debug_bounds("MENU_ITEM-Copy Arcadia Link to Trunk")
+            .is_some()
+    );
+    assert!(
+        cx.debug_bounds("MENU_ITEM-Copy Arcadia Link to Current Branch")
+            .is_some()
+    );
+
+    for (action, revision) in [
+        (
+            Box::new(editor::actions::CopyArcadiaLinkToTrunk) as Box<dyn gpui::Action>,
+            "trunk",
+        ),
+        (
+            Box::new(editor::actions::CopyArcadiaLinkToCurrentBranch) as Box<dyn gpui::Action>,
+            "users%2Ftest%2Ffeature",
+        ),
+    ] {
+        editor.update_in(cx, |editor, window, cx| {
+            use gpui::Focusable as _;
+            window.focus(&editor.focus_handle(cx), cx);
+            window.dispatch_action(action, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(format!(
+                    "https://a.yandex-team.ru/arcadia/src/lib.rs?rev={revision}#L3-6"
+                ))
+            );
+        });
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+    server_cx.update(|cx| {
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("server clipboard".to_owned())
+        )
+    });
 }
 
 #[gpui::test]

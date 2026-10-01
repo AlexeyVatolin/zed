@@ -15,6 +15,7 @@ pub mod draft_prompt_store;
 mod entry_view_state;
 mod external_source_prompt;
 mod favorite_models;
+pub mod herdr_terminal_thread;
 mod inline_assistant;
 mod inline_prompt_editor;
 mod language_model_selector;
@@ -325,6 +326,8 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Starts a persistent Herdr terminal thread.
+        NewHerdrTerminalThread,
     ]
 );
 
@@ -1017,6 +1020,9 @@ mod tests {
             expand_edit_card: true,
             expand_terminal_card: true,
             terminal_init_command: None,
+            terminal_herdr_default_agent: Some("codex".to_owned()),
+            terminal_herdr_enabled: false,
+            terminal_herdr_session_name_regex: None,
             cancel_generation_on_terminal_stop: true,
             use_modifier_to_send: true,
             message_editor_min_lines: 1,
@@ -1051,6 +1057,10 @@ mod tests {
             assert!(
                 !filter.is_hidden(&NewTerminalThread),
                 "NewTerminalThread should be visible by default"
+            );
+            assert!(
+                !filter.is_hidden(&NewHerdrTerminalThread),
+                "NewHerdrTerminalThread should be visible by default"
             );
             assert!(
                 !filter.is_hidden(&zed_actions::assistant::OpenSkillCreator),
@@ -1094,6 +1104,10 @@ mod tests {
             assert!(
                 filter.is_hidden(&NewTerminalThread),
                 "NewTerminalThread should be hidden when agent is disabled"
+            );
+            assert!(
+                filter.is_hidden(&NewHerdrTerminalThread),
+                "NewHerdrTerminalThread should be hidden when agent is disabled"
             );
             assert!(
                 filter.is_hidden(&zed_actions::assistant::OpenGlobalAgentsMdRules),
