@@ -122,6 +122,8 @@ project="$mount/$relative"
 [[ -d "$project" ]] || { echo "Project directory does not exist: $project" >&2; exit 1; }
 project="$(cd -- "$project" && pwd -P)"
 [[ "$project" == "$mount/"* ]] || { echo 'Project directory escapes the Arc mount' >&2; exit 1; }
+# The non-interactive SSH PATH can miss the user's Git shim and its runtime.
+bash -lic 'git -C "$1" --version' zed-arc-workspace-git "$project" >&2
 printf '%s\n%s\n' "$mount" "$project"
 "#;
 
@@ -507,6 +509,32 @@ esac
 "#,
             )?;
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))?;
+            let git_directory = directory.path().join("login-bin");
+            std::fs::create_dir(&git_directory)?;
+            let git = git_directory.join("git");
+            std::fs::write(
+                &git,
+                r#"#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$HOME/git-commands"
+if [[ "${GIT_FAIL:-0}" == 1 ]]; then echo 'Git shim failed' >&2; exit 1; fi
+[[ "$1" == -C && "$3" == --version ]]
+root="$2"
+while [[ ! -e "$root/.arcadia.root" ]]; do
+    [[ "$root" != / ]] || exit 1
+    root="$(dirname -- "$root")"
+done
+mkdir -p -- "$root/.git"
+touch "$root/.git/.arc2git-zed"
+printf 'git version arc2git-zed\n'
+"#,
+            )?;
+            std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755))?;
+            // Simulate a shim configured only in the interactive login shell.
+            std::fs::write(
+                home.join(".bash_profile"),
+                format!("export PATH=\"{}:$PATH\"\n", git_directory.display()),
+            )?;
             Ok(Self { directory, home })
         }
 
@@ -562,6 +590,7 @@ esac
     fn mounts_configured_path_and_reuses_existing_arc_mount() -> Result<()> {
         let fixture = ArcFixture::new()?;
         fixture.create()?;
+        assert!(fixture.mount().join(".git/.arc2git-zed").is_file());
         assert!(!fixture.mount().join("custom/project/.git").exists());
         fixture.create()?;
         assert!(!fixture.mount().join("custom/project/.git").exists());
@@ -574,6 +603,49 @@ esac
             1
         );
         assert!(fixture.store().join("data").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn initializes_git_before_returning_project_paths() -> Result<()> {
+        let fixture = ArcFixture::new()?;
+        let output = fixture.run(
+            CREATE_SCRIPT,
+            &["sample", "~/arcadia-worktrees", "custom/project"],
+            &[],
+        )?;
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)?,
+            format!(
+                "{}\n{}\n",
+                fixture.mount().display(),
+                fixture.mount().join("custom/project").display()
+            )
+        );
+        assert!(fixture.mount().join(".git/.arc2git-zed").is_file());
+        assert_eq!(
+            std::fs::read_to_string(fixture.home.join("git-commands"))?,
+            format!(
+                "-C {} --version\n",
+                fixture.mount().join("custom/project").display()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_git_initialization_does_not_return_project_paths() -> Result<()> {
+        let fixture = ArcFixture::new()?;
+        let output = fixture.run(
+            CREATE_SCRIPT,
+            &["sample", "~/arcadia-worktrees", "custom/project"],
+            &[("GIT_FAIL", "1")],
+        )?;
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Git shim failed"));
+        assert!(fixture.mount().join(".arcadia.root").exists());
         Ok(())
     }
 
