@@ -314,6 +314,8 @@ fn git_panel_context_menu(
     ContextMenu::build(window, cx, |context_menu, _, _| {
         context_menu
             .context(focus_handle.clone())
+            .action("Refresh", git::Refresh.boxed_clone())
+            .separator()
             .action_disabled_when(!has_unstaged_changes, "Stage All", StageAll.boxed_clone())
             .action_disabled_when(!has_staged_changes, "Unstage All", UnstageAll.boxed_clone())
             .action_disabled_when(
@@ -13285,6 +13287,58 @@ mod tests {
 
             assert_eq!(active_path.path, rel_path("untracked").into_arc());
         });
+    }
+
+    #[gpui::test]
+    async fn test_git_refresh_action_without_watcher_event(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "tracked": "new\n" }))
+            .await;
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("tracked", "old\n".into())],
+        );
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        let repository =
+            project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+        assert_eq!(
+            repository.read_with(cx, |repo, _| repo.cached_status().count()),
+            1
+        );
+
+        // An external Arc commit changes VCS state without changing `.git` or
+        // working copy files. Keep HEAD metadata unchanged as a shim might.
+        fs.with_git_state(path!("/project/.git").as_ref(), false, |state| {
+            state
+                .head_contents
+                .insert(repo_path("tracked"), b"new\n".to_vec());
+            state.index_contents = state.head_contents.clone();
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            repository.read_with(cx, |repo, _| repo.cached_status().count()),
+            1
+        );
+
+        // The workspace action works even without a GitPanel instance.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_handle(cx).focus(window, cx);
+        });
+        cx.dispatch_action(git::Refresh);
+        cx.run_until_parked();
+        assert_eq!(
+            repository.read_with(cx, |repo, _| repo.cached_status().count()),
+            0
+        );
     }
 
     #[gpui::test]

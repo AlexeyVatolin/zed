@@ -22,6 +22,10 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    if let Some(exit_code) = util::terminal_agent::run_helper_if_requested() {
+        std::process::exit(exit_code);
+    }
+
     let cli = Cli::parse();
 
     if let Some(socket_path) = &cli.askpass {

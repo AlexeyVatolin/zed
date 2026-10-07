@@ -135,19 +135,128 @@ pub(crate) fn find_from_grid_point<T: EventListener>(
         if let Some((url, url_match)) = url_match {
             Some((url, true, url_match))
         } else {
-            path_match(
-                &term,
-                line_start,
-                line_end,
-                point,
-                &mut regex_searches.path_hyperlink_regexes,
-                regex_searches.path_hyperlink_timeout,
-            )
+            (regex_searches.path_hyperlink_timeout != Duration::ZERO
+                && !regex_searches.path_hyperlink_regexes.is_empty())
+            .then(|| hard_wrapped_path_match(term, point))
+            .flatten()
+            .filter(|(path, _)| {
+                regex_searches.path_hyperlink_regexes.iter().any(|regex| {
+                    regex.captures(path).is_some_and(|captures| {
+                        captures
+                            .name("path")
+                            .or_else(|| captures.get(0))
+                            .is_some_and(|matched| matched.as_str() == path)
+                    })
+                })
+            })
+            .or_else(|| {
+                path_match(
+                    &term,
+                    line_start,
+                    line_end,
+                    point,
+                    &mut regex_searches.path_hyperlink_regexes,
+                    regex_searches.path_hyperlink_timeout,
+                )
+            })
             .map(|(path, path_match)| (path, false, path_match))
         }
     };
 
     found_word.map(|found_word| normalize_found_word(found_word, path_style))
+}
+
+fn hard_wrapped_path_match<T>(term: &Term<T>, hovered: AlacPoint) -> Option<(String, Match)> {
+    // TUI renderers can wrap inline paths with CR/LF instead of setting WRAPLINE.
+    // Only join explicitly delimited absolute paths at the right edge, retaining
+    // their cell styling so unrelated lines are not treated as continuations.
+    const MAX_ROWS: i32 = 16;
+    const MAX_PATH_BYTES: usize = 8192;
+    let grid = term.grid();
+    let columns = grid.columns();
+    let first_row = (hovered.line.0 - MAX_ROWS + 1).max(term.topmost_line().0);
+
+    for row in (first_row..=hovered.line.0).rev() {
+        let line = alacritty_terminal::index::Line(row);
+        for column in 0..columns.saturating_sub(1) {
+            let closing = match grid[AlacPoint::new(line, Column(column))].c {
+                '(' => ')',
+                '[' => ']',
+                '"' => '"',
+                '\'' => '\'',
+                '`' => '`',
+                _ => continue,
+            };
+            let start = AlacPoint::new(line, Column(column + 1));
+            if grid[start].c != '/' {
+                continue;
+            }
+            let mut path = String::new();
+            let mut contains_hovered = false;
+            let mut hard_wrapped = false;
+            let mut segment_column = start.column.0;
+            let style = &grid[start];
+            let last_row = (row + MAX_ROWS - 1).min(term.bottommost_line().0);
+
+            'path: for segment_row in row..=last_row {
+                let segment_line = alacritty_terminal::index::Line(segment_row);
+                let last_column = (0..columns).rev().find(|&column| {
+                    let cell = &grid[AlacPoint::new(segment_line, Column(column))];
+                    !cell.c.is_whitespace() && !cell.flags.intersects(WIDE_CHAR_SPACERS)
+                });
+                let Some(last_column) = last_column else {
+                    break;
+                };
+                for column in segment_column..=last_column {
+                    let point = AlacPoint::new(segment_line, Column(column));
+                    let cell = &grid[point];
+                    if cell.flags.intersects(WIDE_CHAR_SPACERS) {
+                        continue;
+                    }
+                    if cell.c == closing {
+                        if hard_wrapped && contains_hovered {
+                            let end = point.sub(term, Boundary::Grid, 1);
+                            return Some((path, start..=end));
+                        }
+                        break 'path;
+                    }
+                    if cell.c.is_whitespace()
+                        || matches!(cell.c, '(' | ')' | '[' | ']' | '"' | '\'' | '`')
+                        || cell.fg != style.fg
+                        || cell.bg != style.bg
+                        || path.len() >= MAX_PATH_BYTES
+                    {
+                        break 'path;
+                    }
+                    contains_hovered |= point == hovered;
+                    path.push(cell.c);
+                }
+                if last_column + 3 < columns || segment_row == last_row {
+                    break;
+                }
+                let wraps = grid[AlacPoint::new(segment_line, Column(columns - 1))]
+                    .flags
+                    .contains(Flags::WRAPLINE);
+                hard_wrapped |= !wraps;
+                let next_line = segment_line + 1;
+                segment_column = if wraps {
+                    0
+                } else {
+                    (0..columns)
+                        .find(|&column| {
+                            !grid[AlacPoint::new(next_line, Column(column))]
+                                .c
+                                .is_whitespace()
+                        })
+                        .unwrap_or(columns)
+                };
+                if !wraps && segment_column > 4 {
+                    break;
+                }
+            }
+        }
+    }
+    None
 }
 
 fn normalize_found_word(
@@ -499,6 +608,109 @@ mod tests {
     use url::Url;
     use util::paths::PathWithPosition;
 
+    #[test]
+    fn hard_wrapped_inline_path_is_clickable_on_both_rows() {
+        let first = "  Подготовил план с полным diff (/home/vatolin/arcadia-worktrees/automation-log-CLEANWEB-6828/junk/vatolin/ai/plans/pingers-automation-";
+        let second = "  results-CLEANWEB-6828.md).";
+        let path = "/home/vatolin/arcadia-worktrees/automation-log-CLEANWEB-6828/junk/vatolin/ai/plans/pingers-automation-results-CLEANWEB-6828.md";
+        for margin in 0..=2 {
+            let term = hard_wrapped_term(first.chars().count() + margin, &[first, second]);
+            for hovered in [
+                AlacPoint::new(Line(0), Column(40)),
+                AlacPoint::new(Line(1), Column(5)),
+            ] {
+                let (found, range) = hard_wrapped_path_match(&term, hovered).expect("wrapped path");
+                assert_eq!(found, path);
+                assert_eq!(range.start(), &AlacPoint::new(Line(0), Column(33)));
+                assert_eq!(range.end(), &AlacPoint::new(Line(1), Column(25)));
+                let mut searches =
+                    RegexSearches::new([r"(?<path>/[^\s()]+)"], Duration::from_secs(1));
+                let found = find_from_grid_point(&term, hovered, &mut searches, PathStyle::Unix)
+                    .expect("path navigation target");
+                assert_eq!(found.text, path);
+                assert!(!found.is_url);
+                assert_eq!(found.range, Range::from_alacritty(range));
+            }
+            assert!(hard_wrapped_path_match(&term, AlacPoint::new(Line(1), Column(0))).is_none());
+        }
+    }
+
+    #[test]
+    fn hard_wrapped_path_does_not_join_unrelated_lines() {
+        for (columns, lines) in [
+            (40, vec!["See (/home/vatolin/short-", "  next.md)."]),
+            (24, vec!["See (/home/vatolin/path-", "", "  next.md)."]),
+            (
+                24,
+                vec![
+                    "See (/home/vatolin/path-",
+                    "  next.md without a closing delimiter",
+                ],
+            ),
+            (24, vec!["See /home/vatolin/path-", "  next.md)."]),
+        ] {
+            let term = hard_wrapped_term(columns, &lines);
+            assert!(hard_wrapped_path_match(&term, AlacPoint::new(Line(0), Column(10))).is_none());
+        }
+    }
+
+    #[test]
+    fn hard_wrapped_path_preserves_cell_style_boundary() {
+        let mut term = hard_wrapped_term(24, &["See (/home/vatolin/path-", "  next.md)."]);
+        term.grid_mut()[AlacPoint::new(Line(1), Column(2))].fg =
+            alacritty_terminal::vte::ansi::Color::Indexed(1);
+        assert!(hard_wrapped_path_match(&term, AlacPoint::new(Line(0), Column(10))).is_none());
+    }
+
+    #[test]
+    fn hard_wrapped_path_spans_multiple_rows() {
+        let path = "/home/vatolin/arcadia-worktrees/automation-log-CLEANWEB-6828/plan.md";
+        let lines = [
+            format!("({}", &path[..22]),
+            format!("  {}", &path[22..44]),
+            format!("  {})", &path[44..]),
+        ];
+        let lines = lines.iter().map(String::as_str).collect::<Vec<_>>();
+        let term = hard_wrapped_term(24, &lines);
+        for row in 0..3 {
+            let (found, _) = hard_wrapped_path_match(&term, AlacPoint::new(Line(row), Column(5)))
+                .expect("wrapped path");
+            assert_eq!(found, path);
+        }
+    }
+
+    #[test]
+    fn hard_wrapped_path_obeys_hyperlink_settings() {
+        let term = hard_wrapped_term(24, &["See (/home/vatolin/path-", "  next.md)."]);
+        for (regexes, timeout) in [
+            (vec![r"(?<path>/[^\s()]+)"], Duration::ZERO),
+            (vec![], Duration::from_secs(1)),
+            (vec![r"(?<path>/different/path)"], Duration::from_secs(1)),
+        ] {
+            let mut searches = RegexSearches::new(regexes, timeout);
+            assert!(
+                find_from_grid_point(
+                    &term,
+                    AlacPoint::new(Line(1), Column(5)),
+                    &mut searches,
+                    PathStyle::Unix,
+                )
+                .is_none()
+            );
+        }
+    }
+
+    fn hard_wrapped_term(columns: usize, lines: &[&str]) -> Term<VoidListener> {
+        let mut term = Term::new(Config::default(), &TermSize::new(columns, 24), VoidListener);
+        for line in lines {
+            for character in line.chars() {
+                term.input(character);
+            }
+            term.move_down_and_cr(1);
+        }
+        term
+    }
+
     fn re_test(re: &str, hay: &str, expected: Vec<&str>) {
         let results: Vec<_> = Regex::new(re)
             .unwrap()
@@ -717,6 +929,16 @@ mod tests {
         ///
         macro_rules! test_path {
             ($($lines:literal),+) => { test_hyperlink!($($lines),+; Path) };
+        }
+
+        #[test]
+        fn markdown_escaped_path() {
+            test_path!(
+                "Markdown-отчёт (‹«data/crawler\\_switch\\_👉eligible\\_results.md»›) обновляется каждые 10 хостов."
+            );
+            test_path!(
+                "Markdown-отчёт (‹«data/crawler👉\\_switch\\_eligible\\_results.md»›) обновляется."
+            );
         }
 
         #[test]

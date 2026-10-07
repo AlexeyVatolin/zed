@@ -2421,6 +2421,7 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        herdr_session: None,
     };
 
     cx.update(|_, cx| {
@@ -3652,6 +3653,7 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        herdr_session: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3759,6 +3761,7 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        herdr_session: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3907,6 +3910,7 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        herdr_session: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {

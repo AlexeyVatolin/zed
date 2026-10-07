@@ -179,6 +179,24 @@ pub fn init(cx: &mut App) {
             },
         );
 
+        workspace.register_action(|workspace, _: &git::Refresh, _, cx| {
+            let Some(repository) = workspace.project().read(cx).active_repository(cx) else {
+                return;
+            };
+            let refresh = repository.update(cx, |repository, cx| repository.refresh(cx));
+            cx.spawn(async move |workspace, cx| {
+                if let Err(error) = async { refresh.await? }.await {
+                    workspace.update(cx, |_, cx| {
+                        if let Some(workspace) = workspace.upgrade() {
+                            git_panel::show_error_toast(workspace, "refresh", error, cx);
+                        }
+                    })?;
+                }
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        });
+
         let project = workspace.project().read(cx);
         if project.is_read_only(cx) {
             return;
@@ -1202,6 +1220,8 @@ mod remote_button {
                         .when_some(keybinding_target.clone(), |el, keybinding_target| {
                             el.context(keybinding_target)
                         })
+                        .action("Refresh", git::Refresh.boxed_clone())
+                        .separator()
                         .action("Fetch", git::Fetch.boxed_clone())
                         .action("Fetch From", git::FetchFrom.boxed_clone())
                         .action("Pull", git::Pull.boxed_clone())
