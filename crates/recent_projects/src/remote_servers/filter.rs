@@ -289,6 +289,7 @@ mod tests {
                         .map(|path| ProjectEntry {
                             project: RemoteProject {
                                 paths: vec![(*path).to_string()],
+                                ..Default::default()
                             },
                         })
                         .collect();
@@ -300,6 +301,7 @@ mod tests {
                             .iter()
                             .map(|p| RemoteProject {
                                 paths: vec![(*p).to_string()],
+                                ..Default::default()
                             })
                             .collect(),
                         ..Default::default()

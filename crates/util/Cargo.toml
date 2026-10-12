@@ -32,6 +32,8 @@ schemars = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_json_lenient.workspace = true
+shlex.workspace = true
+uuid.workspace = true
 tempfile = { workspace = true, optional = true }
 unicase.workspace = true
 url.workspace = true
@@ -54,14 +56,15 @@ dirs.workspace = true
 log.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+sysinfo.workspace = true
 command-fds = "0.3.1"
 libc.workspace = true
 nix = { workspace = true, features = ["resource", "user"] }
 tempfile.workspace = true
+which.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2.workspace = true
-which.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 which.workspace = true

@@ -174,6 +174,7 @@ pub enum IconName {
     Github,
     Gitlab,
     Hash,
+    Herdr,
     HistoryRerun,
     Image,
     Inception,

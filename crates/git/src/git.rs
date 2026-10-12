@@ -77,6 +77,8 @@ actions!(
         /// Unstages every entry in the section containing the selected entry.
         UnstageSection,
         // repo-wide
+        /// Reloads the active repository's Git state and open diffs.
+        Refresh,
         /// Stages all changes in the repository.
         StageAll,
         /// Unstages all changes in the repository.
