@@ -1,5 +1,6 @@
 pub mod agent_registry_store;
 pub mod agent_server_store;
+pub mod arcadia;
 pub mod bookmark_store;
 pub mod buffer_store;
 pub mod color_extractor;
@@ -336,6 +337,10 @@ pub struct ToastLink {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    TerminalAgentSessionUpdated {
+        terminal_thread_id: String,
+        session: Option<util::terminal_agent::TerminalAgentSession>,
+    },
     LanguageServerAdded(LanguageServerId, LanguageServerName, Option<WorktreeId>),
     SupplementaryLanguageServerAdded(LanguageServerId, LanguageServerName),
     LanguageServerRemoved(LanguageServerId),
@@ -1417,6 +1422,8 @@ impl Project {
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
                     local_handles: Vec::new(),
+                    agent_integrations: Default::default(),
+                    agent_sessions: Default::default(),
                 },
                 node: Some(node),
                 search_history: Self::new_search_history(),
@@ -1661,6 +1668,8 @@ impl Project {
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
                     local_handles: Vec::new(),
+                    agent_integrations: Default::default(),
+                    agent_sessions: Default::default(),
                 },
                 node: Some(node),
                 search_history: Self::new_search_history(),
@@ -1693,6 +1702,7 @@ impl Project {
             remote_proto.add_entity_message_handler(Self::handle_update_worktree);
             remote_proto.add_entity_message_handler(Self::handle_update_project);
             remote_proto.add_entity_message_handler(Self::handle_toast);
+            remote_proto.add_entity_message_handler(Self::handle_terminal_agent_session_updated);
             remote_proto.add_entity_message_handler(Self::handle_telemetry_event);
             remote_proto.add_entity_request_handler(Self::handle_language_server_prompt_request);
             remote_proto
@@ -1954,6 +1964,8 @@ impl Project {
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
                     local_handles: Vec::new(),
+                    agent_integrations: Default::default(),
+                    agent_sessions: Default::default(),
                 },
                 node: None,
                 search_history: Self::new_search_history(),

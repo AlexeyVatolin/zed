@@ -184,6 +184,9 @@ fi
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
 zed_dir="${temp_dir}/zed$suffix.app"
+if [ "$channel" = "nightly" ]; then
+  zed_dir="${temp_dir}/zed-custom.app"
+fi
 
 # Cargo may reuse its outputs on the next invocation. Strip packaging copies
 # so reruns still upload full ELFs and extract complete debug companions.
@@ -225,8 +228,9 @@ if [[ "$channel" == "preview" ]]; then
   export APP_NAME="Zed Preview"
   APP_ID="dev.zed.Zed-Preview"
 elif [[ "$channel" == "nightly" ]]; then
-  export APP_NAME="Zed Nightly"
-  APP_ID="dev.zed.Zed-Nightly"
+  export APP_NAME="Zed Custom"
+  APP_ID="io.github.alexeyvatolin.ZedCustom"
+  export APP_CLI="zed-custom"
 elif [[ "$channel" == "dev" ]]; then
   export APP_NAME="Zed Devel"
   APP_ID="dev.zed.Zed-Dev"
@@ -249,6 +253,6 @@ archive="zed-linux-${arch}.tar.gz"
 rm -rf "${archive}"
 remove_match="zed(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
 ls "${target_dir}/release" | grep -E ${remove_match} | xargs -d "\n" -I {} rm -f "${target_dir}/release/{}" || true
-tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "zed$suffix.app"
+tar -czvf "${target_dir}/release/$archive" -C "${temp_dir}" "$(basename "$zed_dir")"
 
 gzip -f --stdout --best "${temp_dir}/remote_server" > "${target_dir}/zed-remote-server-linux-${arch}.gz"
