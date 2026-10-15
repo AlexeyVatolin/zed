@@ -275,7 +275,7 @@ impl WslRemoteConnection {
         }
 
         let wanted_version = match release_channel {
-            ReleaseChannel::Nightly | ReleaseChannel::Dev => None,
+            ReleaseChannel::Dev => None,
             _ => Some(cx.update(|cx| AppVersion::global(cx))),
         };
 

@@ -9,6 +9,11 @@ message GitBranchesResponse {
   optional string error = 2;
 }
 
+message RefreshGitRepository {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+}
+
 message UpdateDiffBases {
   uint64 project_id = 1;
   uint64 buffer_id = 2;
@@ -86,6 +91,18 @@ message GetFilePermalink {
 
 message GetFilePermalinkResponse {
   string permalink = 1;
+}
+
+message GetArcadiaLink {
+  uint64 project_id = 1;
+  ProjectPath path = 2;
+  uint32 start_row = 3;
+  uint32 end_row = 4;
+  bool current_branch = 5;
+}
+
+message GetArcadiaLinkResponse {
+  string url = 1;
 }
 
 message Branch {

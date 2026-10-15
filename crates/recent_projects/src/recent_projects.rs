@@ -1,3 +1,5 @@
+mod arc_workspace_modal;
+pub use arc_workspace_modal::{delete_arc_workspace, open_arc_workspace_modal};
 mod dev_container_suggest;
 pub mod disconnected_overlay;
 mod remote_connections;
@@ -1249,6 +1251,11 @@ impl PickerDelegate for RecentProjectsDelegate {
                 let worktree_id = folder.worktree_id;
                 let positions = positions.clone();
                 let show_path = self.style == ProjectPickerStyle::Modal;
+                let managed_arc_workspace =
+                    folder.connection_options.as_ref().is_some_and(|options| {
+                        workspace::arc_workspaces::managed_workspace(options, &folder.path, cx)
+                            .is_some()
+                    });
 
                 let secondary_actions = h_flex()
                     .gap_1()
@@ -1259,7 +1266,11 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 let focus_handle = self.focus_handle.clone();
                                 move |_, cx| {
                                     Tooltip::for_action_in(
-                                        "Remove Folder from Project",
+                                        if managed_arc_workspace {
+                                            "Delete Arc Workspace from Server"
+                                        } else {
+                                            "Remove Folder from Project"
+                                        },
                                         &RemoveSelected,
                                         &focus_handle,
                                         cx,
@@ -1353,6 +1364,8 @@ impl PickerDelegate for RecentProjectsDelegate {
             ProjectPickerEntry::ProjectGroup(hit) => {
                 let key = self.window_project_groups.get(hit.candidate_id)?;
                 let is_active = self.is_active_project_group(key, cx);
+                let managed_arc_workspace =
+                    workspace::arc_workspaces::managed_workspace_for_group(key, cx).is_some();
                 let paths = key.path_list();
                 let ordered_paths: Vec<_> = paths
                     .ordered_paths()
@@ -1423,7 +1436,11 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 let focus_handle = self.focus_handle.clone();
                                 move |_, cx| {
                                     Tooltip::for_action_in(
-                                        "Remove Project from Window",
+                                        if managed_arc_workspace {
+                                            "Delete Arc Workspace from Server"
+                                        } else {
+                                            "Remove Project from Window"
+                                        },
                                         &RemoveSelected,
                                         &focus_handle,
                                         cx,
@@ -2380,26 +2397,34 @@ impl RecentProjectsDelegate {
         };
 
         let old_key = workspace.read(cx).project_group_key(cx);
-        workspace.update(cx, |workspace, cx| {
-            let project = workspace.project().clone();
-            project.update(cx, |project, cx| {
-                project.remove_worktree(worktree_id, cx);
-            });
-        });
-
-        let new_key = workspace.read(cx).project_group_key(cx);
-        if let Some(entry) = picker
-            .delegate
-            .window_project_groups
-            .iter_mut()
-            .find(|key| **key == old_key)
-        {
-            *entry = new_key;
-        }
-
-        picker.delegate.open_folders = get_open_folders(workspace.read(cx), cx);
-        let query = picker.query(cx);
-        picker.update_matches(query, window, cx);
+        let project = workspace.read(cx).project().clone();
+        let fs = workspace.read(cx).app_state().fs.clone();
+        let task =
+            workspace::arc_workspaces::remove_open_folder(project, worktree_id, fs, window, cx);
+        cx.spawn_in(window, async move |this, cx| match task.await {
+            Ok(true) => {
+                this.update_in(cx, |picker, window, cx| {
+                    let new_key = workspace.read(cx).project_group_key(cx);
+                    if let Some(entry) = picker
+                        .delegate
+                        .window_project_groups
+                        .iter_mut()
+                        .find(|key| **key == old_key)
+                    {
+                        *entry = new_key;
+                    }
+                    picker.delegate.open_folders = get_open_folders(workspace.read(cx), cx);
+                    let query = picker.query(cx);
+                    picker.update_matches(query, window, cx);
+                })
+                .log_err();
+            }
+            Ok(false) => {}
+            Err(error) => {
+                workspace.update(cx, |workspace, cx| workspace.show_error(error, cx));
+            }
+        })
+        .detach();
     }
 
     fn remove_project_group(
@@ -2408,6 +2433,47 @@ impl RecentProjectsDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
+        if let Some((options, arc_workspace)) =
+            workspace::arc_workspaces::managed_workspace_for_group(&key, cx)
+        {
+            if let Some(source) = self.workspace.upgrade() {
+                let task = delete_arc_workspace(&source, options, arc_workspace, window, cx);
+                cx.spawn_in(window, async move |this, cx| match task.await {
+                    Ok(true) => {
+                        this.update_in(cx, |picker, window, cx| {
+                            if let Some(handle) =
+                                window.window_handle().downcast::<MultiWorkspace>()
+                            {
+                                let key = key.clone();
+                                cx.defer(move |cx| {
+                                    handle
+                                        .update(cx, |multi_workspace, window, cx| {
+                                            multi_workspace
+                                                .remove_project_group(&key, window, cx)
+                                                .detach_and_log_err(cx);
+                                        })
+                                        .log_err();
+                                });
+                            }
+                            picker
+                                .delegate
+                                .window_project_groups
+                                .retain(|group| group != &key);
+                            picker.delegate.open_folders = get_open_folders(source.read(cx), cx);
+                            let query = picker.query(cx);
+                            picker.update_matches(query, window, cx);
+                        })
+                        .log_err();
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        source.update(cx, |source, cx| source.show_error(error, cx));
+                    }
+                })
+                .detach();
+            }
+            return;
+        }
         if let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() {
             let key_for_remove = key.clone();
             cx.defer(move |cx| {

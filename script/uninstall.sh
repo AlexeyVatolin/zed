@@ -43,6 +43,18 @@ main() {
         exit 1
     fi
 
+    if [ "$channel" = "nightly" ]; then
+        if [ "$platform" = "macos" ]; then
+            rm -rf '/Applications/Zed Custom.app'
+        else
+            rm -rf "$HOME/.local/zed-custom.app"
+            rm -f "$HOME/.local/share/applications/io.github.alexeyvatolin.ZedCustom.desktop"
+        fi
+        rm -f "$HOME/.local/bin/zed-custom"
+        echo "Zed Custom has been uninstalled; its settings were kept"
+        return
+    fi
+
     "$platform"
 
     echo "Zed has been uninstalled"
