@@ -105,12 +105,25 @@ pub async fn get_release_by_tag_name(
 ) -> anyhow::Result<GithubRelease> {
     let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/releases/tags/{tag}");
 
-    let request = github_api_request(&url)?;
+    get_release(&url, http).await
+}
+
+pub async fn get_latest_release(
+    repo_name_with_owner: &str,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<GithubRelease> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/releases/latest");
+
+    get_release(&url, http).await
+}
+
+async fn get_release(url: &str, http: Arc<dyn HttpClient>) -> anyhow::Result<GithubRelease> {
+    let request = github_api_request(url)?;
 
     let mut response = http
         .send(request)
         .await
-        .context("error fetching latest release")?;
+        .context("error fetching GitHub release")?;
 
     let mut body = Vec::new();
     let status = response.status();
@@ -118,9 +131,9 @@ pub async fn get_release_by_tag_name(
         .body_mut()
         .read_to_end(&mut body)
         .await
-        .context("error reading latest release")?;
+        .context("error reading GitHub release")?;
 
-    if status.is_client_error() {
+    if !status.is_success() {
         let text = String::from_utf8_lossy(body.as_slice());
         bail!(
             "status error {}, response: {text:?}",

@@ -59,16 +59,19 @@ fn possible_hover_target(
         cx,
         background_path_checks,
     );
+    let path_like_target = path_like_target.clone();
     cx.spawn(async move |terminal_view, cx| {
         let file_to_open = file_to_open_task.await;
         terminal_view
             .update(cx, |terminal_view, cx| {
                 match file_to_open {
-                    Some(OpenTarget::Path(path, ..) | OpenTarget::Worktree(path, ..)) => {
+                    Some(open_target) => {
                         terminal_view.hover = Some(HoverTarget {
-                            tooltip: path
+                            tooltip: open_target
+                                .path()
                                 .to_string(&|path: &PathBuf| path.to_string_lossy().into_owned()),
                             hovered_word,
+                            resolved_path: Some((path_like_target, open_target)),
                         });
                     }
                     None => {
@@ -88,23 +91,8 @@ pub(super) fn open_path_like_target(
     window: &mut Window,
     cx: &mut Context<TerminalView>,
 ) {
-    #[cfg(not(test))]
-    {
-        possibly_open_target(workspace, terminal_view, path_like_target, window, cx)
-            .detach_and_log_err(cx)
-    }
-    #[cfg(test)]
-    {
-        possibly_open_target(
-            workspace,
-            terminal_view,
-            path_like_target,
-            window,
-            cx,
-            BackgroundPathChecks::LocalFileSystem,
-        )
+    possibly_open_target(workspace, terminal_view, path_like_target, window, cx)
         .detach_and_log_err(cx)
-    }
 }
 
 fn possibly_open_target(
@@ -113,43 +101,20 @@ fn possibly_open_target(
     path_like_target: &PathLikeTarget,
     window: &mut Window,
     cx: &mut Context<TerminalView>,
-    #[cfg(test)] background_path_checks: BackgroundPathChecks,
 ) -> Task<Result<Option<OpenTarget>>> {
-    if terminal_view.hover.is_none() {
+    let Some((_, open_target)) = terminal_view
+        .hover
+        .as_ref()
+        .and_then(|hover| hover.resolved_path.as_ref())
+        .filter(|(hovered_path, _)| hovered_path == path_like_target)
+    else {
         return Task::ready(Ok(None));
-    }
+    };
+    // Hover already checked the file. Reuse that result on click instead of
+    // repeating the SSH metadata request; opening still loads the current file.
+    let open_target = open_target.clone();
     let workspace = workspace.clone();
-    let path_like_target = path_like_target.clone();
-    cx.spawn_in(window, async move |terminal_view, cx| {
-        let Some(open_target) = terminal_view
-            .update(cx, |_, cx| {
-                #[cfg(not(test))]
-                {
-                    resolve_open_target(
-                        &workspace,
-                        PathMatching::Heuristic,
-                        &path_like_target.maybe_path,
-                        path_like_target.working_directory.as_deref(),
-                        cx,
-                    )
-                }
-                #[cfg(test)]
-                {
-                    resolve_open_target_with_fs_checks(
-                        &workspace,
-                        PathMatching::Heuristic,
-                        &path_like_target.maybe_path,
-                        path_like_target.working_directory.as_deref(),
-                        cx,
-                        background_path_checks,
-                    )
-                }
-            })?
-            .await
-        else {
-            return Ok(None);
-        };
-
+    cx.spawn_in(window, async move |_, cx| {
         let opened = open_resolved_target(&workspace, &open_target, cx).await?;
         Ok(opened.then_some(open_target))
     })
@@ -179,6 +144,19 @@ mod tests {
         PathLikeTarget,
         BackgroundPathChecks,
     ) -> (Option<HoverTarget>, Option<OpenTarget>) {
+        init_test_with_unscanned_files(app_cx, trees, worktree_roots, []).await
+    }
+
+    async fn init_test_with_unscanned_files(
+        app_cx: &mut TestAppContext,
+        trees: impl IntoIterator<Item = (&str, serde_json::Value)>,
+        worktree_roots: impl IntoIterator<Item = &str>,
+        unscanned_trees: impl IntoIterator<Item = (&str, serde_json::Value)>,
+    ) -> impl AsyncFnMut(
+        HoveredWord,
+        PathLikeTarget,
+        BackgroundPathChecks,
+    ) -> (Option<HoverTarget>, Option<OpenTarget>) {
         let fs = app_cx.update(AppState::test).fs.as_fake().clone();
 
         app_cx.update(|cx| {
@@ -196,6 +174,14 @@ mod tests {
             app_cx,
         )
         .await;
+
+        let mut unscanned_trees = unscanned_trees.into_iter().peekable();
+        if unscanned_trees.peek().is_some() {
+            fs.pause_events();
+        }
+        for (path, tree) in unscanned_trees {
+            fs.insert_tree(path, tree).await;
+        }
 
         let (multi_workspace, cx) = app_cx
             .add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -253,7 +239,6 @@ mod tests {
                         &path_like_target,
                         window,
                         cx,
-                        background_path_checks,
                     )
                 })
                 .await
@@ -471,6 +456,36 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg(not(windows))]
+    async fn markdown_escaped_paths(cx: &mut TestAppContext) {
+        test_path_likes!(
+            cx,
+            vec![(
+                path!("/project"),
+                json!({
+                    "data": { "crawler_switch_eligible_results.md": "report" },
+                    "literal\\_name.md": "literal",
+                    "literal_name.md": "decoded",
+                })
+            )],
+            vec![path!("/project")],
+            {
+                test!(
+                    r"data/crawler\_switch\_eligible\_results.md",
+                    "/project/data/crawler_switch_eligible_results.md",
+                    None
+                );
+                test!(
+                    r"/project/data/crawler\_switch\_eligible\_results.md",
+                    "/project/data/crawler_switch_eligible_results.md",
+                    None
+                );
+                test!(r"literal\_name.md", r"/project/literal\_name.md", None);
+            }
+        );
+    }
+
+    #[gpui::test]
     async fn one_folder_worktree(cx: &mut TestAppContext) {
         test_path_likes!(
             cx,
@@ -489,6 +504,59 @@ mod tests {
                 test!("/test/test.rs", "/test/test.rs", None);
             }
         )
+    }
+
+    #[gpui::test]
+    async fn remote_relative_path_without_cwd_in_unscanned_directory(cx: &mut TestAppContext) {
+        let mut test_path_like = init_test_with_unscanned_files(
+            cx,
+            vec![(path!("/project"), json!({ "known.rs": "" }))],
+            vec![path!("/project")],
+            vec![(
+                path!("/project/generated"),
+                json!({ "plain.rs": "", "dotted.rs": "" }),
+            )],
+        )
+        .await;
+        test_path_like!(
+            test_path_like,
+            "generated/plain.rs",
+            "/project/generated/plain.rs",
+            None,
+            BackgroundPathChecks::ProjectPathResolution,
+            OpenTargetFoundBy::BackgroundPathResolution
+        );
+        test_path_like!(
+            test_path_like,
+            "./generated/dotted.rs",
+            "/project/generated/dotted.rs",
+            None,
+            BackgroundPathChecks::ProjectPathResolution,
+            OpenTargetFoundBy::BackgroundPathResolution
+        );
+    }
+
+    #[gpui::test]
+    async fn remote_relative_path_checks_folder_worktrees(cx: &mut TestAppContext) {
+        let mut test_path_like = init_test_with_unscanned_files(
+            cx,
+            vec![
+                (path!("/first"), json!({ "known.rs": "" })),
+                (path!("/second"), json!({ "known.rs": "" })),
+                (path!("/loose.rs"), json!("")),
+            ],
+            vec![path!("/loose.rs"), path!("/first"), path!("/second")],
+            vec![(path!("/second/generated"), json!({ "later.rs": "" }))],
+        )
+        .await;
+        test_path_like!(
+            test_path_like,
+            "generated/later.rs",
+            "/second/generated/later.rs",
+            None,
+            BackgroundPathChecks::ProjectPathResolution,
+            OpenTargetFoundBy::BackgroundPathResolution
+        );
     }
 
     #[gpui::test]

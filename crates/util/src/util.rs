@@ -24,6 +24,8 @@ pub mod redact;
 pub mod schemars;
 pub mod serde;
 pub mod size;
+#[cfg(not(target_family = "wasm"))]
+pub mod terminal_agent;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 pub mod time;

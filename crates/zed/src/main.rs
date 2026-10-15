@@ -5,15 +5,8 @@ mod reliability;
 mod watcher_debug;
 mod zed;
 
-// Ensure the binary name stays in sync with APP_NAME so that the paths used
-// at runtime (data dir, config dir, etc.) match what the binary is called.
-const _: () = assert!(
-    paths::APP_NAME_LOWERCASE
-        .as_bytes()
-        .eq_ignore_ascii_case(env!("CARGO_BIN_NAME").as_bytes()),
-    "paths::APP_NAME_LOWERCASE must match the binary name. \
-     Forks: update APP_NAME in crates/paths/src/paths.rs when renaming the binary.",
-);
+// The fork keeps the `zed` executable inside Zed Custom.app while using
+// separate ZedCustom data and configuration directories.
 
 use agent_ui::AgentPanel;
 use anyhow::{Context as _, Result};
@@ -209,6 +202,10 @@ fn main() {
 
     #[cfg(unix)]
     util::prevent_root_execution();
+
+    if let Some(exit_code) = util::terminal_agent::run_helper_if_requested() {
+        std::process::exit(exit_code);
+    }
 
     let args = Args::parse();
 
