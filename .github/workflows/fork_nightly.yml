@@ -71,7 +71,8 @@ jobs:
             echo 'skip=true' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git diff --binary --full-index "$base" HEAD > "$RUNNER_TEMP/fork.patch"
+          git diff --binary --full-index "$base" HEAD -- . \
+            ':(exclude).github/workflows' > "$RUNNER_TEMP/fork.patch"
           git checkout --detach "$upstream_sha"
           if ! git apply --3way --index "$RUNNER_TEMP/fork.patch"; then
             git status --short
@@ -81,17 +82,25 @@ jobs:
 
           printf 'nightly\n' > crates/zed/RELEASE_CHANNEL
           git add crates/zed/RELEASE_CHANNEL
+          # GITHUB_TOKEN cannot publish new upstream workflows or their history.
+          git restore --source="$patch_sha" --staged --worktree -- .github/workflows
 
           git config user.name 'Zed Custom release'
           git config user.email 'zed-custom-release@users.noreply.github.com'
           patch_timestamp=$(git show -s --format=%cI "$patch_sha")
-          GIT_AUTHOR_DATE="$patch_timestamp" GIT_COMMITTER_DATE="$patch_timestamp" \
-            git commit --allow-empty -m "Apply Zed Custom patches to upstream $SOURCE_REF"
-          build_sha=$(git rev-parse HEAD)
+          build_sha=$(
+            GIT_AUTHOR_DATE="$patch_timestamp" GIT_COMMITTER_DATE="$patch_timestamp" \
+              git commit-tree "$(git write-tree)" -p "$patch_sha" \
+                -m "Apply Zed Custom patches to upstream $SOURCE_REF" \
+                -m "Upstream commit: $upstream_sha"
+          )
+          git checkout --detach "$build_sha"
+          git diff --exit-code "$patch_sha" "$build_sha" -- .github/workflows
           version=$(./script/get-crate-version zed)
           tag="v${version}+nightly.${GITHUB_RUN_NUMBER}.${build_sha}"
           printf 'skip=false\nbuild_sha=%s\ntag=%s\n' "$build_sha" "$tag" >> "$GITHUB_OUTPUT"
-          git bundle create "$RUNNER_TEMP/candidate.bundle" HEAD "^$upstream_sha"
+          git bundle create "$RUNNER_TEMP/candidate.bundle" HEAD "^$patch_sha"
+          git bundle verify "$RUNNER_TEMP/candidate.bundle"
       - uses: actions/upload-artifact@v4
         if: steps.compose.outputs.skip == 'false'
         with:
@@ -248,6 +257,8 @@ jobs:
           git fetch upstream "$UPSTREAM_SHA"
           git fetch "$RUNNER_TEMP/candidate.bundle" HEAD
           git checkout --detach "$BUILD_SHA"
+          test "$(git rev-parse HEAD^)" = "$PATCH_SHA"
+          git diff --exit-code "$PATCH_SHA" HEAD -- .github/workflows
           if git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
             test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$BUILD_SHA"
           else
