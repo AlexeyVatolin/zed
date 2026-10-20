@@ -1253,6 +1253,7 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    delayed_animation_frames: FxHashMap<Duration, FxHashSet<EntityId>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
@@ -2150,6 +2151,7 @@ impl Window {
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            delayed_animation_frames: FxHashMap::default(),
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -2730,6 +2732,30 @@ impl Window {
     pub fn request_animation_frame(&self) {
         let entity = self.current_view();
         self.on_next_frame(move |_, cx| cx.notify(entity));
+    }
+
+    pub(crate) fn request_delayed_animation_frame(&mut self, interval: Duration, cx: &App) {
+        let view = self.current_view();
+        // Share a timer across views so staggered spinners don't multiply the window's frame rate.
+        let needs_timer = !self.delayed_animation_frames.contains_key(&interval);
+        self.delayed_animation_frames
+            .entry(interval)
+            .or_default()
+            .insert(view);
+        if needs_timer {
+            self.spawn(cx, async move |cx| {
+                cx.background_executor().timer(interval).await;
+                cx.update(move |window, cx| {
+                    if let Some(views) = window.delayed_animation_frames.remove(&interval) {
+                        for view in views {
+                            cx.notify(view);
+                        }
+                    }
+                })
+                .log_err();
+            })
+            .detach();
+        }
     }
 
     /// Runs all callbacks scheduled via [`Self::on_next_frame`], returning how many ran.

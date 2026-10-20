@@ -1,5 +1,5 @@
 use scheduler::Instant;
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::{rc::Rc, time::Duration};
 
 use crate::{
     AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
@@ -64,8 +64,8 @@ impl Animation {
 
     /// Limit how often this animation re-renders. Instead of re-rendering on
     /// every frame, the animation schedules its next render `1 / max_fps`
-    /// seconds after the current one. Values that are not finite and positive
-    /// are ignored.
+    /// seconds after the current one. Animations with the same limit share a
+    /// timer within each window. Values that are not finite and positive are ignored.
     pub fn with_max_fps(mut self, max_fps: f32) -> Self {
         self.max_fps = Some(max_fps);
         self
@@ -234,9 +234,6 @@ impl<E: IntoElement + 'static> IntoElement for AnimationElement<E> {
 struct AnimationState {
     start: Instant,
     animation_ix: usize,
-    /// Whether a throttled re-render (see [`Animation::with_max_fps`]) is
-    /// already scheduled, so overlapping renders don't stack extra timers.
-    delayed_frame_pending: Rc<Cell<bool>>,
 }
 
 struct SpringElementState {
@@ -402,7 +399,6 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
             let mut state = state.unwrap_or_else(|| AnimationState {
                 start: Instant::now(),
                 animation_ix: 0,
-                delayed_frame_pending: Rc::new(Cell::new(false)),
             });
             let (animation_ix, delta, done) = if cx.reduce_motion() {
                 let animation_ix = self.animations.len() - 1;
@@ -451,19 +447,8 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
             if !done {
                 match self.animations[animation_ix].max_fps {
                     Some(max_fps) if max_fps.is_finite() && max_fps > 0.0 => {
-                        if !state.delayed_frame_pending.get() {
-                            state.delayed_frame_pending.set(true);
-                            let delayed_frame_pending = state.delayed_frame_pending.clone();
-                            let view = window.current_view();
-                            let interval = Duration::from_secs_f32(1.0 / max_fps);
-                            window
-                                .spawn(cx, async move |cx| {
-                                    cx.background_executor().timer(interval).await;
-                                    delayed_frame_pending.set(false);
-                                    cx.update(move |_, cx| cx.notify(view)).ok();
-                                })
-                                .detach();
-                        }
+                        let interval = Duration::from_secs_f32(1.0 / max_fps);
+                        window.request_delayed_animation_frame(interval, cx);
                     }
                     _ => window.request_animation_frame(),
                 }
@@ -569,6 +554,7 @@ mod tests {
     struct AnimationTestView {
         rendered_deltas: Rc<RefCell<Vec<f32>>>,
         max_fps: Option<f32>,
+        show_second: bool,
     }
 
     struct SyncedAnimationTestView {
@@ -637,14 +623,19 @@ mod tests {
             } else {
                 animation = animation.repeat();
             }
-            div().size_full().child(div().with_animation(
-                "repeating-animation",
-                animation,
-                move |this, delta| {
-                    rendered_deltas.borrow_mut().push(delta);
-                    this
-                },
-            ))
+            div()
+                .size_full()
+                .child(div().with_animation(
+                    "repeating-animation",
+                    animation.clone(),
+                    move |this, delta| {
+                        rendered_deltas.borrow_mut().push(delta);
+                        this
+                    },
+                ))
+                .when(self.show_second, |this| {
+                    this.child(div().with_animation("second-animation", animation, |this, _| this))
+                })
         }
     }
 
@@ -664,6 +655,7 @@ mod tests {
             move |_, _| AnimationTestView {
                 rendered_deltas,
                 max_fps,
+                show_second: false,
             }
         });
         cx.run_until_parked();
@@ -960,6 +952,35 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(105));
         cx.run_until_parked();
         assert_deltas_approx_eq(&[0.0, 0.105, 0.21]);
+    }
+
+    #[gpui::test]
+    fn test_staggered_throttled_animations_share_frame_requests(cx: &mut TestAppContext) {
+        let (rendered_deltas, window) = open_test_window_with_max_fps(cx, Some(10.0));
+
+        cx.executor().advance_clock(Duration::from_millis(50));
+        window
+            .update(cx, |view, _, cx| {
+                view.show_second = true;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(rendered_deltas.borrow().len(), 2);
+
+        cx.executor().advance_clock(Duration::from_millis(55));
+        cx.run_until_parked();
+        assert_eq!(rendered_deltas.borrow().len(), 3);
+        assert_eq!(simulate_next_frame(&window, cx), 0);
+
+        // A separate timer for the second animation would redraw at 150 ms.
+        cx.executor().advance_clock(Duration::from_millis(55));
+        cx.run_until_parked();
+        assert_eq!(rendered_deltas.borrow().len(), 3);
+
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+        assert_eq!(rendered_deltas.borrow().len(), 4);
     }
 
     #[gpui::test]
