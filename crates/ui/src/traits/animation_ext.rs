@@ -33,7 +33,10 @@ pub trait CommonAnimationExt: AnimationExt {
     {
         self.with_animation(
             id,
-            Animation::new(Duration::from_secs(duration)).repeat_synced(),
+            // Small status icons should not keep the entire window rendering at display refresh rate.
+            Animation::new(Duration::from_secs(duration))
+                .repeat_synced()
+                .with_max_fps(10.0),
             |component, delta| component.transform(Transformation::rotate(percentage(delta))),
         )
     }
