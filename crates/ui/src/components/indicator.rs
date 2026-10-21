@@ -141,9 +141,12 @@ impl Component for Indicator {
         v_flex()
             .gap_6()
             .children(vec![
-                single_example(
-                    "Running Blocks",
-                    BlockIndicator::new(IconSize::Small).into_any_element(),
+                example_group_with_title(
+                    "Running Indicators",
+                    vec![single_example(
+                        "Blocks",
+                        BlockIndicator::new(IconSize::Small).into_any_element(),
+                    )],
                 ),
                 example_group_with_title(
                     "Dot Indicators",
