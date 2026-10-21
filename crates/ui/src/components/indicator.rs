@@ -140,11 +140,11 @@ impl Component for Indicator {
     fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
         v_flex()
             .gap_6()
+            .child(single_example(
+                "Running Blocks",
+                BlockIndicator::new(IconSize::Small).into_any_element(),
+            ))
             .children(vec![
-                single_example(
-                    "Running Blocks",
-                    BlockIndicator::new(IconSize::Small).into_any_element(),
-                ),
                 example_group_with_title(
                     "Dot Indicators",
                     vec![
