@@ -2743,8 +2743,11 @@ impl Window {
             .or_default()
             .insert(view);
         if needs_timer {
+            // Rendering can arrive late; retain the shared cadence instead of accumulating that delay.
+            let elapsed = cx.background_executor().now() - cx.synced_animation_epoch;
+            let delay = animation_frame_delay(elapsed, interval);
             self.spawn(cx, async move |cx| {
-                cx.background_executor().timer(interval).await;
+                cx.background_executor().timer(delay).await;
                 cx.update(move |window, cx| {
                     if let Some(views) = window.delayed_animation_frames.remove(&interval) {
                         for view in views {
@@ -7895,6 +7898,15 @@ fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(),
     }
 }
 
+fn animation_frame_delay(elapsed: Duration, interval: Duration) -> Duration {
+    let remainder = elapsed.as_nanos() % interval.as_nanos();
+    interval
+        - Duration::new(
+            (remainder / 1_000_000_000) as u64,
+            (remainder % 1_000_000_000) as u32,
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -7914,6 +7926,27 @@ mod tests {
         TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions,
         canvas, div, hsla, point, px, size,
     };
+
+    #[test]
+    fn test_animation_frame_delay_keeps_the_cadence_after_late_frames() {
+        let interval = Duration::from_millis(100);
+        assert_eq!(
+            super::animation_frame_delay(Duration::ZERO, interval),
+            interval
+        );
+        for frame in 0..100 {
+            for lateness in [0, 1, 7, 25, 99] {
+                let elapsed = Duration::from_millis(frame * 100 + lateness);
+                let delay = super::animation_frame_delay(elapsed, interval);
+                assert_eq!(elapsed + delay, Duration::from_millis((frame + 1) * 100));
+            }
+        }
+        let elapsed = Duration::from_secs(300 * 24 * 60 * 60) + Duration::from_millis(7);
+        assert_eq!(
+            super::animation_frame_delay(elapsed, interval),
+            Duration::from_millis(93)
+        );
+    }
 
     #[cfg(feature = "profiler")]
     #[gpui::test]

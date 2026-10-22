@@ -57,9 +57,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
-    AgentThreadStatus, BlockIndicator, ContextMenu, ContextMenuEntry, Divider, GradientFade,
-    HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
+    AgentThreadStatus, ContextMenu, ContextMenuEntry, Divider, GradientFade, HighlightedLabel,
+    KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes, Scrollbars,
+    SpinnerIndicator, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
     prelude::*, render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
@@ -2435,7 +2435,7 @@ impl Sidebar {
                     )
                     .when(is_collapsed, |this| {
                         this.when(has_running_threads, |this| {
-                            this.child(BlockIndicator::new(IconSize::XSmall))
+                            this.child(SpinnerIndicator::new(IconSize::XSmall))
                         })
                         .when(waiting_thread_count > 0, |this| {
                             let tooltip_text = if waiting_thread_count == 1 {
