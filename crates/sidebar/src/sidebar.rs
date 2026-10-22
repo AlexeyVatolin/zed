@@ -2521,7 +2521,7 @@ impl Sidebar {
             })
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    if event.modifiers().secondary() {
+                    if event.modifiers().secondary(cx) {
                         this.activate_or_open_workspace_for_group(&key_for_focus, window, cx);
                     } else if !this.has_filter_query(cx) {
                         this.toggle_collapse(&key_for_toggle, window, cx);
@@ -3007,7 +3007,7 @@ impl Sidebar {
                                         let action = h_flex()
                                             .opacity(0.6)
                                             .children(render_modifiers(
-                                                &Modifiers::secondary_key(),
+                                                &Modifiers::secondary_key(cx),
                                                 PlatformStyle::platform(),
                                                 None,
                                                 Some(TextSize::Default.rems(cx).into()),
@@ -3405,7 +3405,7 @@ impl Sidebar {
     }
 
     fn dispatch_context(&self, window: &Window, cx: &Context<Self>) -> KeyContext {
-        let mut dispatch_context = KeyContext::new_with_defaults();
+        let mut dispatch_context = KeyContext::new_with_defaults(cx.platform_info().os);
         dispatch_context.add("ThreadsSidebar");
         dispatch_context.add("menu");
 
@@ -5567,8 +5567,58 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let store = ThreadMetadataStore::global(cx);
-        let metadata = store.read(cx).entry_by_session(session_id).cloned();
+        let (metadata, thread_entry) = self.thread_to_archive(session_id, cx);
+
+        if let (
+            Some(metadata),
+            Some(ThreadEntryWorkspace::Closed {
+                folder_paths,
+                project_group_key,
+            }),
+        ) = (
+            metadata.as_ref(),
+            thread_entry.as_ref().map(|thread| &thread.workspace),
+        ) && self.should_load_closed_workspace_for_archive(
+            folder_paths,
+            project_group_key,
+            metadata.remote_connection.as_ref(),
+            Some(metadata.thread_id),
+            None,
+            cx,
+        ) {
+            let session_id = session_id.clone();
+            self.open_workspace_for_archive(
+                folder_paths.clone(),
+                project_group_key.clone(),
+                window,
+                cx,
+                move |this, _workspace, window, cx| {
+                    this.update_entries(cx);
+                    let (metadata, thread_entry) = this.thread_to_archive(&session_id, cx);
+                    this.archive_thread_in_loaded_workspace(
+                        &session_id,
+                        metadata,
+                        thread_entry,
+                        window,
+                        cx,
+                    );
+                },
+            );
+            return;
+        }
+
+        self.archive_thread_in_loaded_workspace(session_id, metadata, thread_entry, window, cx);
+    }
+
+    fn thread_to_archive(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> (Option<ThreadMetadata>, Option<Arc<ThreadEntry>>) {
+        let metadata = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(session_id)
+            .cloned();
         let metadata_thread_id = metadata.as_ref().map(|metadata| metadata.thread_id);
         let thread_entry = self.contents.entries.iter().find_map(|entry| match entry {
             ListEntry::Thread(thread) => metadata_thread_id
@@ -5579,6 +5629,18 @@ impl Sidebar {
                 .then(|| thread.clone()),
             _ => None,
         });
+        (metadata, thread_entry)
+    }
+
+    fn archive_thread_in_loaded_workspace(
+        &mut self,
+        session_id: &acp::SessionId,
+        metadata: Option<ThreadMetadata>,
+        thread_entry: Option<Arc<ThreadEntry>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let metadata_thread_id = metadata.as_ref().map(|metadata| metadata.thread_id);
         let thread_id = metadata_thread_id.or_else(|| {
             thread_entry
                 .as_ref()
@@ -5606,37 +5668,6 @@ impl Sidebar {
                     .as_ref()
                     .map(|workspace| PathList::new(&workspace.read(cx).root_paths(cx)))
             });
-        let thread_entry_workspace = thread_entry.map(|thread| thread.workspace.clone());
-
-        if let (
-            Some(metadata),
-            Some(ThreadEntryWorkspace::Closed {
-                folder_paths,
-                project_group_key,
-            }),
-        ) = (metadata.as_ref(), thread_entry_workspace)
-            && self.should_load_closed_workspace_for_archive(
-                &folder_paths,
-                &project_group_key,
-                metadata.remote_connection.as_ref(),
-                Some(metadata.thread_id),
-                None,
-                cx,
-            )
-        {
-            let session_id = session_id.clone();
-            self.open_workspace_for_archive(
-                folder_paths,
-                project_group_key,
-                window,
-                cx,
-                move |this, _workspace, window, cx| {
-                    this.update_entries(cx);
-                    this.archive_thread(&session_id, window, cx);
-                },
-            );
-            return;
-        }
 
         // Compute which linked worktree roots should be archived from disk if
         // this thread is archived. This must happen before we remove any
@@ -5962,7 +5993,9 @@ impl Sidebar {
         match self.contents.entries.get(ix) {
             Some(ListEntry::Thread(thread)) => {
                 match thread.status {
-                    AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation => {
+                    AgentThreadStatus::Running
+                    | AgentThreadStatus::WaitingForConfirmation
+                    | AgentThreadStatus::Unconfirmed => {
                         return;
                     }
                     AgentThreadStatus::Completed | AgentThreadStatus::Error => {}
@@ -6459,9 +6492,11 @@ impl Sidebar {
         let is_selected = is_active;
         let is_draft = thread.draft.is_some();
         let is_empty_draft = thread.draft == Some(DraftKind::Empty);
-        let is_running = matches!(
+        let can_request_stop = matches!(
             thread.status,
-            AgentThreadStatus::Running | AgentThreadStatus::WaitingForConfirmation
+            AgentThreadStatus::Running
+                | AgentThreadStatus::WaitingForConfirmation
+                | AgentThreadStatus::Unconfirmed
         );
         let is_renaming =
             self.rename_target == Some(RenameTarget::Thread(thread.metadata.thread_id));
@@ -6567,13 +6602,19 @@ impl Sidebar {
                         })
                     });
 
-                let contextual_action: Option<AnyElement> = if is_running {
+                let contextual_action: Option<AnyElement> = if can_request_stop {
                     Some(
                         IconButton::new("stop-thread", IconName::Stop)
                             .icon_size(IconSize::Small)
                             .icon_color(Color::Error)
                             .style(ButtonStyle::Tinted(TintColor::Error))
-                            .tooltip(Tooltip::text("Stop Generation"))
+                            .tooltip(Tooltip::text(
+                                if thread.status == AgentThreadStatus::Unconfirmed {
+                                    "Request Stop (Activity Unconfirmed)"
+                                } else {
+                                    "Stop Generation"
+                                },
+                            ))
                             .on_click(cx.listener(move |this, _, _window, cx| {
                                 this.stop_thread(&thread_id_for_actions, cx);
                             }))
@@ -7645,7 +7686,11 @@ impl Sidebar {
                     )
             })
             .when(right_window_controls, |this| {
-                this.children(Self::render_right_window_controls(window, cx))
+                this
+                    // Without projects, nothing flex-grows to push right-side window controls
+                    // to the edge.
+                    .when(no_open_projects, |this| this.justify_end())
+                    .children(Self::render_right_window_controls(window, cx))
             })
     }
 
@@ -8327,6 +8372,7 @@ fn all_thread_infos_for_workspace(
                 AgentThreadStatus::Error
             } else {
                 match thread.status() {
+                    ThreadStatus::Unconfirmed => AgentThreadStatus::Unconfirmed,
                     ThreadStatus::Generating => AgentThreadStatus::Running,
                     ThreadStatus::Idle => AgentThreadStatus::Completed,
                 }
@@ -8535,6 +8581,7 @@ fn dump_single_workspace(workspace: &Workspace, output: &mut String, cx: &gpui::
             let title = thread.title().unwrap_or_else(|| "(untitled)".into());
             let session_id = thread.session_id();
             let status = match thread.status() {
+                ThreadStatus::Unconfirmed => "unconfirmed",
                 ThreadStatus::Idle => "idle",
                 ThreadStatus::Generating => "generating",
             };
@@ -8569,6 +8616,7 @@ fn dump_single_workspace(workspace: &Workspace, output: &mut String, cx: &gpui::
                     let thread = thread_view.read(cx).thread.read(cx);
                     let title = thread.title().unwrap_or_else(|| "(untitled)".into());
                     let status = match thread.status() {
+                        ThreadStatus::Unconfirmed => "unconfirmed",
                         ThreadStatus::Idle => "idle",
                         ThreadStatus::Generating => "generating",
                     };

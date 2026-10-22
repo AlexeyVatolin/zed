@@ -198,6 +198,8 @@ jobs:
           ./script/download-wasi-sdk
       - name: Test updater
         run: cargo test -p auto_update
+      - name: Test file finder
+        run: cargo test --locked -p file_finder
       - name: Build Linux x86_64
         env:
           CARGO_INCREMENTAL: "0"
