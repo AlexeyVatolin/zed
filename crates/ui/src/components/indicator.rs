@@ -1,7 +1,5 @@
 use super::AnyIcon;
 use crate::prelude::*;
-use gpui::{Animation, AnimationExt};
-use std::time::Duration;
 
 #[derive(Default)]
 enum IndicatorKind {
@@ -87,42 +85,27 @@ impl RenderOnce for Indicator {
 }
 
 #[derive(IntoElement)]
-pub struct BlockIndicator {
+pub struct SpinnerIndicator {
     size: IconSize,
 }
 
-impl BlockIndicator {
+impl SpinnerIndicator {
     pub fn new(size: IconSize) -> Self {
         Self { size }
     }
 }
 
-impl RenderOnce for BlockIndicator {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let color = Color::Muted.color(cx);
-        div()
+impl RenderOnce for SpinnerIndicator {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        h_flex()
             .flex_none()
             .size(self.size.rems())
-            .grid()
-            .grid_cols(2)
-            .grid_rows(2)
-            .gap(px(1.0))
-            .with_animation(
-                "block-indicator",
-                // Only the highlighted block changes, so intermediate frames waste redraws.
-                Animation::new(Duration::from_secs(1))
-                    .repeat_synced()
-                    .with_max_fps(4.0),
-                move |container, delta| {
-                    let active = (delta * 4.0) as usize % 4;
-                    container.children([0, 1, 3, 2].into_iter().map(|phase| {
-                        div().size_full().bg(color).opacity(if phase == active {
-                            1.0
-                        } else {
-                            0.25
-                        })
-                    }))
-                },
+            .justify_center()
+            .child(
+                crate::SpinnerLabel::dots()
+                    .size(LabelSize::Custom(self.size.rems()))
+                    .line_height_style(LineHeightStyle::UiLabel)
+                    .single_line(),
             )
     }
 }
@@ -140,11 +123,14 @@ impl Component for Indicator {
     fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
         v_flex()
             .gap_6()
-            .child(single_example(
-                "Running Blocks",
-                BlockIndicator::new(IconSize::Small).into_any_element(),
-            ))
             .children(vec![
+                example_group_with_title(
+                    "Running Indicators",
+                    vec![single_example(
+                        "Text",
+                        SpinnerIndicator::new(IconSize::Small).into_any_element(),
+                    )],
+                ),
                 example_group_with_title(
                     "Dot Indicators",
                     vec![

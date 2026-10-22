@@ -1,4 +1,4 @@
-use crate::{BlockIndicator, DiffStat, GradientFade, HighlightedLabel, Tooltip, prelude::*};
+use crate::{DiffStat, GradientFade, HighlightedLabel, SpinnerIndicator, Tooltip, prelude::*};
 
 use gpui::{
     Animation, AnimationExt, ClickEvent, Hsla, MouseButton, SharedString,
@@ -341,7 +341,7 @@ impl RenderOnce for ThreadItem {
 
         let icon = if self.status == AgentThreadStatus::Running {
             icon_container()
-                .child(BlockIndicator::new(IconSize::Small))
+                .child(SpinnerIndicator::new(IconSize::Small))
                 .into_any_element()
         } else if let Some(status_icon) = status_icon {
             icon_container().child(status_icon).into_any_element()

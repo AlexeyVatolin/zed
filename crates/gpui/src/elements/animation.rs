@@ -63,8 +63,8 @@ impl Animation {
     }
 
     /// Limit how often this animation re-renders. Instead of re-rendering on
-    /// every frame, the animation schedules its next render `1 / max_fps`
-    /// seconds after the current one. Animations with the same limit share a
+    /// every frame, the animation schedules renders on a shared clock at
+    /// `1 / max_fps` second intervals. Animations with the same limit share a
     /// timer within each window. Values that are not finite and positive are ignored.
     pub fn with_max_fps(mut self, max_fps: f32) -> Self {
         self.max_fps = Some(max_fps);
@@ -447,7 +447,8 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
             if !done {
                 match self.animations[animation_ix].max_fps {
                     Some(max_fps) if max_fps.is_finite() && max_fps > 0.0 => {
-                        let interval = Duration::from_secs_f32(1.0 / max_fps);
+                        let interval = Duration::from_secs_f64(1.0 / f64::from(max_fps))
+                            .max(Duration::from_nanos(1));
                         window.request_delayed_animation_frame(interval, cx);
                     }
                     _ => window.request_animation_frame(),
@@ -952,6 +953,30 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(105));
         cx.run_until_parked();
         assert_deltas_approx_eq(&[0.0, 0.105, 0.21]);
+    }
+
+    #[gpui::test]
+    fn test_throttled_animation_keeps_every_frame_across_loop_boundaries(cx: &mut TestAppContext) {
+        let (rendered_deltas, _window) = open_test_window_with_max_fps(cx, Some(10.0));
+
+        for frame in 1..=30 {
+            // Alternate arrivals at 7 ms and 3 ms past a clock boundary.
+            // Scheduling relative to the last render would lose every second update.
+            let elapsed = if frame == 1 {
+                107
+            } else if frame % 2 == 0 {
+                96
+            } else {
+                104
+            };
+            cx.executor().advance_clock(Duration::from_millis(elapsed));
+            cx.run_until_parked();
+
+            let deltas = rendered_deltas.borrow();
+            assert_eq!(deltas.len(), frame + 1);
+            let phase = *deltas.last().expect("rendered animation frame");
+            assert_eq!((phase * 10.0) as usize % 10, frame % 10);
+        }
     }
 
     #[gpui::test]

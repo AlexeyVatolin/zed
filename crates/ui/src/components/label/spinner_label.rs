@@ -33,21 +33,24 @@ pub enum SpinnerVariant {
 pub struct SpinnerLabel {
     base: Label,
     variant: SpinnerVariant,
-    frames: Vec<&'static str>,
-    duration: Duration,
 }
 
 impl SpinnerVariant {
-    fn frames(&self) -> Vec<&'static str> {
+    fn frames(&self) -> &'static [&'static str] {
         match self {
-            SpinnerVariant::Dots => vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
-            SpinnerVariant::DotsVariant => vec!["⣼", "⣹", "⢻", "⠿", "⡟", "⣏", "⣧", "⣶"],
-            SpinnerVariant::Sand => vec![
+            SpinnerVariant::Dots => &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+            SpinnerVariant::DotsVariant => &["⣼", "⣹", "⢻", "⠿", "⡟", "⣏", "⣧", "⣶"],
+            SpinnerVariant::Sand => &[
                 "⠁", "⠂", "⠄", "⡀", "⡈", "⡐", "⡠", "⣀", "⣁", "⣂", "⣄", "⣌", "⣔", "⣤", "⣥", "⣦",
                 "⣮", "⣶", "⣷", "⣿", "⡿", "⠿", "⢟", "⠟", "⡛", "⠛", "⠫", "⢋", "⠋", "⠍", "⡉", "⠉",
                 "⠑", "⠡", "⢁",
             ],
         }
+    }
+
+    fn frame_at(&self, delta: f32) -> &'static str {
+        let frames = self.frames();
+        frames[(delta * frames.len() as f32) as usize % frames.len()]
     }
 
     fn duration(&self) -> Duration {
@@ -73,14 +76,9 @@ impl SpinnerLabel {
     }
 
     pub fn with_variant(variant: SpinnerVariant) -> Self {
-        let frames = variant.frames();
-        let duration = variant.duration();
-
         SpinnerLabel {
-            base: Label::new(frames[0]).color(Color::Muted),
+            base: Label::new(variant.frame_at(0.0)).color(Color::Muted),
             variant,
-            frames,
-            duration,
         }
     }
 
@@ -161,16 +159,17 @@ impl LabelCommon for SpinnerLabel {
 
 impl RenderOnce for SpinnerLabel {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let frames = self.frames.clone();
-        let duration = self.duration;
+        let variant = self.variant;
+        let duration = variant.duration();
+        let frames_per_second = variant.frames().len() as f32 / duration.as_secs_f32();
 
         self.base.with_animation(
-            self.variant.animation_id(),
-            Animation::new(duration).repeat(),
+            variant.animation_id(),
+            Animation::new(duration)
+                .repeat_synced()
+                .with_max_fps(frames_per_second),
             move |mut label, delta| {
-                let frame_index = (delta * frames.len() as f32) as usize % frames.len();
-
-                label.set_text(frames[frame_index]);
+                label.set_text(variant.frame_at(delta));
                 label
             },
         )
@@ -206,5 +205,35 @@ impl Component for SpinnerLabel {
         ];
 
         example_group(examples).vertical().into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dots_show_every_frame_for_an_equal_part_of_the_cycle() {
+        let variant = SpinnerVariant::Dots;
+        let expected_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        assert_eq!(variant.duration(), Duration::from_secs(1));
+        for (index, expected) in expected_frames.into_iter().enumerate() {
+            for offset in [0.0, 0.5, 0.999] {
+                let delta = (index as f32 + offset) / 10.0;
+                assert_eq!(variant.frame_at(delta), expected, "phase {delta}");
+            }
+        }
+        assert_eq!(variant.frame_at(1.0), "⠋");
+    }
+
+    #[test]
+    fn dots_change_at_most_two_positions_including_the_loop_boundary() {
+        let frames = SpinnerVariant::Dots.frames();
+        for (current, next) in frames.iter().zip(frames.iter().cycle().skip(1)) {
+            let current = current.chars().next().expect("braille frame") as u32;
+            let next = next.chars().next().expect("braille frame") as u32;
+            assert!((current ^ next).count_ones() <= 2);
+            assert_ne!(current, next);
+        }
     }
 }
