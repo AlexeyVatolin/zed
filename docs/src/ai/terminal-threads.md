@@ -113,6 +113,8 @@ When the active agent reports a terminal title, the Terminal Thread shows that c
 
 For example, run `herdr integration install codex` or `herdr integration install claude` on the host where the agent runs. These integrations also let Herdr report the current native session ID when you switch conversations inside one terminal.
 
+In a regular Terminal Thread on macOS or Linux, running `herdr`, `herdr --session NAME`, or `herdr session attach NAME` converts that thread to a Herdr Terminal Thread. Zed remembers the session and reconnects after closing the project or restarting Zed. Detaching from Herdr and returning to the shell converts the thread back to a regular terminal without stopping the server. This uses the same Bash, Zsh, and Fish command tracking as Codex and Claude above; aliases, shell functions, absolute executable paths, `command herdr`, remote attach flags, and custom socket overrides bypass automatic adoption.
+
 Closing or archiving the Terminal Thread in Zed stops and deletes its Herdr session. Zed removes the thread after Herdr confirms deletion. If deletion fails, Zed keeps the thread so you can retry. Herdr must be available on remote hosts as well as local hosts when using remote projects.
 
 ## Terminal Thread Titles {#terminal-thread-titles}

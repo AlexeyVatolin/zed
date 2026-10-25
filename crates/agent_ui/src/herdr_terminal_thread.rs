@@ -14,7 +14,10 @@ use util::paths::PathStyle;
 const MAX_HERDR_SESSION_NAME_BYTES: usize = 64;
 pub const INSTALL_COMMAND: &str = "curl -fsSL https://herdr.dev/install.sh | sh";
 const MISSING_HERDR: &str = "zed: herdr executable not found";
-const LAUNCH_SCRIPT: &str = r#"if command -v herdr >/dev/null 2>&1; then
+const LAUNCH_SCRIPT: &str = r#"if [ "$1" = "--session" ] && [ -n "$ZED_TERMINAL_AGENT_SOCKET" ] && [ -x "$ZED_TERMINAL_AGENT_HELPER" ]; then
+    exec "$ZED_TERMINAL_AGENT_HELPER" --terminal-agent-run herdr -- "$@"
+fi
+if command -v herdr >/dev/null 2>&1; then
     exec herdr "$@"
 elif [ -x "${HERDR_INSTALL_DIR:-$HOME/.local/bin}/herdr" ]; then
     exec "${HERDR_INSTALL_DIR:-$HOME/.local/bin}/herdr" "$@"
