@@ -426,6 +426,34 @@ async fn test_absolute_path_outside_project(cx: &mut TestAppContext) {
         "ordinary search must not access the filesystem"
     );
 
+    let stale_lookup = picker.update_in(cx, |picker, window, cx| {
+        picker.delegate.lookup_absolute_path(
+            test_path_position(path!("/outside/external.rs")),
+            picker.delegate.search_generation,
+            window,
+            cx,
+        )
+    });
+    picker
+        .update_in(cx, |picker, window, cx| {
+            picker.delegate.update_matches("known".into(), window, cx)
+        })
+        .await;
+    stale_lookup.await;
+    picker.update(cx, |picker, _| {
+        assert_eq!(
+            picker
+                .delegate
+                .latest_search_query
+                .as_ref()
+                .unwrap()
+                .path_query(),
+            "known"
+        );
+        assert_match_at_position(picker, 0, "known.rs");
+    });
+
+    let metadata_calls = fs.metadata_call_count();
     let external_path = PathBuf::from(path!("/outside/external.rs"));
     picker
         .update_in(cx, |picker, window, cx| {
@@ -482,17 +510,23 @@ async fn test_absolute_path_outside_project(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_absolute_selection_survives_history_refresh(cx: &mut TestAppContext) {
+async fn test_absolute_selection_survives_refresh_and_opens_in_splits(cx: &mut TestAppContext) {
     let app_state = init_test(cx);
     app_state
         .fs
         .as_fake()
-        .insert_tree(path!("/root"), json!({ "deleted.rs": "" }))
+        .insert_tree(
+            path!("/root"),
+            json!({ "deleted.rs": "", "known.rs": "known" }),
+        )
         .await;
     app_state
         .fs
         .as_fake()
-        .insert_tree(path!("/outside"), json!({ "external.rs": "" }))
+        .insert_tree(
+            path!("/outside"),
+            json!({ "external.rs": "", "second.rs": "second" }),
+        )
         .await;
     let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
     let (multi_workspace, cx) =
@@ -522,6 +556,9 @@ async fn test_absolute_selection_survives_history_refresh(cx: &mut TestAppContex
         assert_eq!(project.read(cx).worktrees(cx).count(), 1);
     });
 
+    picker.update_in(cx, |picker, window, cx| {
+        picker.delegate.toggle_item_selected(0, window, cx);
+    });
     cx.dispatch_action(pane::SplitRight::default());
     cx.run_until_parked();
     cx.read(|cx| {
@@ -536,46 +573,6 @@ async fn test_absolute_selection_survives_history_refresh(cx: &mut TestAppContex
         );
         assert_eq!(project.read(cx).visible_worktrees(cx).count(), 1);
     });
-}
-
-#[gpui::test]
-async fn test_absolute_paths_outside_project_in_splits(cx: &mut TestAppContext) {
-    let app_state = init_test(cx);
-    app_state
-        .fs
-        .as_fake()
-        .insert_tree(path!("/root"), json!({ "known.txt": "known" }))
-        .await;
-    app_state
-        .fs
-        .as_fake()
-        .insert_tree(
-            path!("/outside"),
-            json!({ "first.txt": "first\nsecond\nthird", "second.txt": "second" }),
-        )
-        .await;
-    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
-    let (picker, workspace, cx) = build_find_picker(project.clone(), cx);
-    picker
-        .update_in(cx, |picker, window, cx| {
-            picker
-                .delegate
-                .update_matches(path!("/outside/first.txt").into(), window, cx)
-        })
-        .await;
-    cx.dispatch_action(pane::SplitRight::default());
-    cx.run_until_parked();
-    cx.read(|cx| {
-        assert_eq!(
-            workspace
-                .read(cx)
-                .active_item_as::<Editor>(cx)
-                .unwrap()
-                .read(cx)
-                .title(cx),
-            "first.txt"
-        )
-    });
     workspace.update_in(cx, |workspace, window, cx| {
         workspace.hide_modal(window, cx);
     });
@@ -585,7 +582,7 @@ async fn test_absolute_paths_outside_project_in_splits(cx: &mut TestAppContext) 
         .update_in(cx, |picker, window, cx| {
             picker
                 .delegate
-                .update_matches(path!("/outside/second.txt").into(), window, cx)
+                .update_matches(path!("/outside/second.rs").into(), window, cx)
         })
         .await;
     picker.update_in(cx, |picker, window, cx| {
@@ -597,7 +594,7 @@ async fn test_absolute_paths_outside_project_in_splits(cx: &mut TestAppContext) 
         })
         .await;
     picker.update_in(cx, |picker, window, cx| {
-        assert_match_at_position(picker, 1, "known.txt");
+        assert_match_at_position(picker, 1, "known.rs");
         picker.delegate.toggle_item_selected(1, window, cx);
         assert_eq!(picker.delegate.selected_matches.len(), 2);
     });
@@ -609,54 +606,11 @@ async fn test_absolute_paths_outside_project_in_splits(cx: &mut TestAppContext) 
         assert_eq!(project.read(cx).visible_worktrees(cx).count(), 1);
         let worktree = project
             .read(cx)
-            .find_worktree(Path::new(path!("/outside/second.txt")), cx)
+            .find_worktree(Path::new(path!("/outside/second.rs")), cx)
             .unwrap()
             .0;
         assert!(worktree.read(cx).is_single_file());
         assert!(!worktree.read(cx).is_visible());
-    });
-}
-
-#[gpui::test]
-async fn test_absolute_path_lookup_does_not_replace_newer_query(cx: &mut TestAppContext) {
-    let app_state = init_test(cx);
-    app_state
-        .fs
-        .as_fake()
-        .insert_tree(path!("/root"), json!({ "known.rs": "" }))
-        .await;
-    app_state
-        .fs
-        .as_fake()
-        .insert_tree(path!("/outside"), json!({ "external.rs": "" }))
-        .await;
-    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
-    let (picker, _, cx) = build_find_picker(project, cx);
-    let stale_lookup = picker.update_in(cx, |picker, window, cx| {
-        picker.delegate.lookup_absolute_path(
-            test_path_position(path!("/outside/external.rs")),
-            picker.delegate.search_generation,
-            window,
-            cx,
-        )
-    });
-    picker
-        .update_in(cx, |picker, window, cx| {
-            picker.delegate.update_matches("known".into(), window, cx)
-        })
-        .await;
-    stale_lookup.await;
-    picker.update(cx, |picker, _| {
-        assert_eq!(
-            picker
-                .delegate
-                .latest_search_query
-                .as_ref()
-                .unwrap()
-                .path_query(),
-            "known"
-        );
-        assert_match_at_position(picker, 0, "known.rs");
     });
 }
 

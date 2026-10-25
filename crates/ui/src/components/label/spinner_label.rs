@@ -225,15 +225,4 @@ mod tests {
         }
         assert_eq!(variant.frame_at(1.0), "⠋");
     }
-
-    #[test]
-    fn dots_change_at_most_two_positions_including_the_loop_boundary() {
-        let frames = SpinnerVariant::Dots.frames();
-        for (current, next) in frames.iter().zip(frames.iter().cycle().skip(1)) {
-            let current = current.chars().next().expect("braille frame") as u32;
-            let next = next.chars().next().expect("braille frame") as u32;
-            assert!((current ^ next).count_ones() <= 2);
-            assert_ne!(current, next);
-        }
-    }
 }

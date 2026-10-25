@@ -654,29 +654,6 @@ fi
         }
 
         #[test]
-        fn herdr_ignores_native_agent_hooks_and_tracks_detach() {
-            let mut state = SessionState::default();
-            let session = TerminalAgentSession {
-                agent: TerminalAgent::Herdr,
-                session_id: Some("existing-session".into()),
-                working_directory: "/project".into(),
-            };
-            assert!(state.apply(Event::Started {
-                launch: "attach".into(),
-                session: session.clone()
-            }));
-            assert!(!state.apply(Event::Session {
-                launch: "attach".into(),
-                session_id: uuid::Uuid::new_v4().to_string()
-            }));
-            assert_eq!(state.session, Some(session));
-            assert!(state.apply(Event::Exited {
-                launch: "attach".into()
-            }));
-            assert!(state.session.is_none());
-        }
-
-        #[test]
         fn hook_installation_preserves_settings_and_is_idempotent() {
             for agent in [TerminalAgent::Claude, TerminalAgent::Codex] {
                 let directory = tempfile::tempdir().unwrap();
@@ -709,29 +686,51 @@ fi
             }
         }
         #[test]
-        fn stale_hooks_and_exits_cannot_change_another_launch() {
-            let mut state = SessionState::default();
-            let session = TerminalAgentSession {
-                agent: TerminalAgent::Codex,
-                session_id: None,
-                working_directory: "/project".into(),
-            };
-            assert!(state.apply(Event::Started {
-                launch: "new".into(),
-                session: session.clone()
-            }));
-            assert!(!state.apply(Event::Session {
-                launch: "old".into(),
-                session_id: uuid::Uuid::new_v4().to_string()
-            }));
-            assert!(!state.apply(Event::Exited {
-                launch: "old".into()
-            }));
-            assert_eq!(state.session, Some(session));
-            assert!(state.apply(Event::Exited {
-                launch: "new".into()
-            }));
-            assert!(state.session.is_none());
+        fn session_events_are_scoped_to_the_launch_and_agent() {
+            for agent in [TerminalAgent::Codex, TerminalAgent::Herdr] {
+                let mut state = SessionState::default();
+                let mut session = TerminalAgentSession {
+                    agent,
+                    session_id: (agent == TerminalAgent::Herdr).then(|| "existing-session".into()),
+                    working_directory: "/project".into(),
+                };
+                assert!(state.apply(Event::Started {
+                    launch: "new".into(),
+                    session: session.clone()
+                }));
+                for event in [
+                    Event::Session {
+                        launch: "old".into(),
+                        session_id: uuid::Uuid::new_v4().to_string(),
+                    },
+                    Event::Exited {
+                        launch: "old".into(),
+                    },
+                ] {
+                    assert!(!state.apply(event));
+                    assert_eq!(state.session, Some(session.clone()));
+                }
+                let session_id = uuid::Uuid::new_v4().to_string();
+                assert_eq!(
+                    state.apply(Event::Session {
+                        launch: "new".into(),
+                        session_id: session_id.clone()
+                    }),
+                    agent != TerminalAgent::Herdr
+                );
+                if agent != TerminalAgent::Herdr {
+                    session.session_id = Some(session_id.clone());
+                }
+                assert_eq!(state.session, Some(session));
+                assert!(!state.apply(Event::Session {
+                    launch: "new".into(),
+                    session_id
+                }));
+                assert!(state.apply(Event::Exited {
+                    launch: "new".into()
+                }));
+                assert!(state.session.is_none());
+            }
         }
         #[test]
         fn hook_installation_preserves_configuration_symlinks() {

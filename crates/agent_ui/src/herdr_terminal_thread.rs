@@ -37,7 +37,7 @@ impl std::fmt::Display for HerdrNotInstalled {
 
 impl std::error::Error for HerdrNotInstalled {}
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HerdrTerminalSession {
     pub name: String,
     pub agent: Option<String>,
@@ -454,56 +454,55 @@ mod tests {
     }
 
     #[test]
-    fn pane_snapshot_tracks_session_switches() {
+    fn pane_snapshot_tracks_conversation_and_title_changes() {
         let mut session = HerdrTerminalSession {
-            name: "project".to_owned(),
-            agent: None,
-            agent_session: None,
-            current_title: None,
-            is_working: false,
-            initial_command: None,
-            initial_command_sent: false,
+            name: "project-2".into(),
+            ..Default::default()
         };
-        let codex = serde_json::json!({"result": {"snapshot": {"focused_pane_id": "w1:p1", "panes": [{"pane_id": "w1:p1", "agent": "codex", "agent_session": {"source": "herdr:codex", "agent": "codex", "kind": "id", "value": "first"}}]}}});
-        assert!(session.update_from_snapshot(&codex));
-        assert_eq!(
-            session
-                .agent_session
-                .as_ref()
-                .map(|value| value.value.as_str()),
-            Some("first")
-        );
-        let next_codex = serde_json::json!({"result": {"snapshot": {"focused_pane_id": "w1:p1", "panes": [{"pane_id": "w1:p1", "agent": "codex", "agent_session": {"source": "herdr:codex", "agent": "codex", "kind": "id", "value": "next"}}]}}});
-        assert!(session.update_from_snapshot(&next_codex));
-        assert_eq!(
-            session
-                .agent_session
-                .as_ref()
-                .map(|value| value.value.as_str()),
-            Some("next")
-        );
-        let claude = serde_json::json!({"result": {"snapshot": {"focused_pane_id": "w1:p1", "panes": [{"pane_id": "w1:p1", "agent": "claude", "agent_session": {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": "second"}}]}}});
-        assert!(session.update_from_snapshot(&claude));
-        assert_eq!(session.icon(), IconName::Herdr);
-        assert_eq!(
-            session
-                .agent_session
-                .as_ref()
-                .map(|value| value.value.as_str()),
-            Some("second")
-        );
+        for (agent, identity, title, expected_title) in [
+            (
+                "codex",
+                "first",
+                "Respond to greeting | project",
+                "Respond to greeting",
+            ),
+            (
+                "codex",
+                "next",
+                "Investigate failing tests | project",
+                "Investigate failing tests",
+            ),
+            ("claude", "second", "project", "project-2"),
+        ] {
+            let snapshot = serde_json::json!({"result": {"snapshot": {
+                "focused_pane_id": "w1:p1",
+                "workspaces": [{"workspace_id": "w1", "label": "project"}],
+                "panes": [{
+                    "pane_id": "w1:p1", "workspace_id": "w1", "agent": agent,
+                    "agent_session": {"source": format!("herdr:{agent}"), "agent": agent, "kind": "id", "value": identity},
+                    "terminal_title_stripped": title
+                }]
+            }}});
+            assert!(session.update_from_snapshot(&snapshot));
+            assert_eq!(session.agent.as_deref(), Some(agent));
+            assert_eq!(
+                session
+                    .agent_session
+                    .as_ref()
+                    .map(|session| session.value.as_str()),
+                Some(identity)
+            );
+            assert_eq!(session.display_title(), expected_title);
+            assert_eq!(session.icon(), IconName::Herdr);
+            assert!(!session.update_from_snapshot(&snapshot));
+        }
     }
 
     #[test]
     fn pane_status_tracks_work_across_the_session() {
         let mut session = HerdrTerminalSession {
             name: "project".to_owned(),
-            agent: None,
-            agent_session: None,
-            current_title: None,
-            is_working: false,
-            initial_command: None,
-            initial_command_sent: false,
+            ..Default::default()
         };
         let snapshot = |status: &str| {
             serde_json::json!({"result": {"snapshot": {
@@ -520,42 +519,5 @@ mod tests {
         assert!(!session.update_from_snapshot(&snapshot("working")));
         assert!(session.update_from_snapshot(&snapshot("idle")));
         assert!(!session.is_working);
-    }
-
-    #[test]
-    fn pane_title_tracks_current_agent_conversation() {
-        let mut session = HerdrTerminalSession {
-            name: "food-photo-apps-2".to_owned(),
-            agent: None,
-            agent_session: None,
-            current_title: None,
-            is_working: false,
-            initial_command: None,
-            initial_command_sent: false,
-        };
-        let snapshot = |title: &str| {
-            serde_json::json!({
-                "result": {"snapshot": {
-                    "focused_pane_id": "w1:p1",
-                    "workspaces": [{"workspace_id": "w1", "label": "food-photo-apps"}],
-                    "panes": [{
-                        "pane_id": "w1:p1",
-                        "workspace_id": "w1",
-                        "agent": "codex",
-                        "terminal_title_stripped": title
-                    }]
-                }}
-            })
-        };
-
-        assert!(session.update_from_snapshot(&snapshot("Respond to greeting | food-photo-apps")));
-        assert_eq!(session.display_title(), "Respond to greeting");
-        assert!(!session.update_from_snapshot(&snapshot("Respond to greeting | food-photo-apps")));
-        assert!(
-            session.update_from_snapshot(&snapshot("Investigate failing tests | food-photo-apps"))
-        );
-        assert_eq!(session.display_title(), "Investigate failing tests");
-        assert!(session.update_from_snapshot(&snapshot("food-photo-apps")));
-        assert_eq!(session.display_title(), "food-photo-apps-2");
     }
 }

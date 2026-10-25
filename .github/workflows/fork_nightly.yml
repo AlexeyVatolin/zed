@@ -31,7 +31,8 @@ jobs:
       build_sha: ${{ steps.compose.outputs.build_sha }}
       tag: ${{ steps.compose.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - &checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Apply fork changes to upstream source
@@ -115,14 +116,14 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - *checkout
+      - &download_candidate
+        uses: actions/download-artifact@v4
         with:
           name: candidate-bundle
           path: ${{ runner.temp }}
-      - name: Check out candidate
+      - &checkout_candidate
+        name: Check out candidate
         env:
           UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
           BUILD_SHA: ${{ needs.prepare.outputs.build_sha }}
@@ -174,24 +175,9 @@ jobs:
       CC: clang-18
       CXX: clang++-18
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/download-artifact@v4
-        with:
-          name: candidate-bundle
-          path: ${{ runner.temp }}
-      - name: Check out candidate
-        env:
-          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
-          BUILD_SHA: ${{ needs.prepare.outputs.build_sha }}
-        run: |
-          set -euo pipefail
-          git remote add upstream https://github.com/zed-industries/zed.git
-          git fetch upstream "$UPSTREAM_SHA"
-          git fetch "$RUNNER_TEMP/candidate.bundle" HEAD
-          git checkout --detach "$BUILD_SHA"
-          test "$(cat crates/zed/RELEASE_CHANNEL)" = nightly
+      - *checkout
+      - *download_candidate
+      - *checkout_candidate
       - name: Install build dependencies
         run: |
           ./script/linux
@@ -229,13 +215,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: actions/download-artifact@v4
-        with:
-          name: candidate-bundle
-          path: ${{ runner.temp }}
+      - *checkout
+      - *download_candidate
       - uses: actions/download-artifact@v4
         with:
           name: macos-release

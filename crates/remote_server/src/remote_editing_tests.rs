@@ -5906,17 +5906,20 @@ async fn terminal_relative_links_resolve_unscanned_remote_files(
     let visual_cx = cx.add_empty_window();
     let workspace = visual_cx
         .new_window_entity(|window, cx| workspace::Workspace::test_new(project, window, cx));
-    let metadata_calls = fs.metadata_call_count();
-    let cached = visual_cx
-        .update(|_, cx| {
+    use workspace::path_link::PathMatching;
+    let resolve = |path: &str, matching| {
+        visual_cx.update(|_, cx| {
             workspace::path_link::resolve_open_target(
                 &workspace.downgrade(),
-                workspace::path_link::PathMatching::Heuristic,
-                "src/known.rs",
+                matching,
+                path,
                 None,
                 cx,
             )
         })
+    };
+    let metadata_calls = fs.metadata_call_count();
+    let cached = resolve("src/known.rs", PathMatching::Heuristic)
         .await
         .unwrap();
     assert_eq!(
@@ -5929,16 +5932,7 @@ async fn terminal_relative_links_resolve_unscanned_remote_files(
         "known paths must not send metadata requests"
     );
 
-    let resolved = visual_cx
-        .update(|_, cx| {
-            workspace::path_link::resolve_open_target(
-                &workspace.downgrade(),
-                workspace::path_link::PathMatching::Heuristic,
-                "./generated/later.rs",
-                None,
-                cx,
-            )
-        })
+    let resolved = resolve("./generated/later.rs", PathMatching::Heuristic)
         .await
         .unwrap();
     assert_eq!(
@@ -5950,16 +5944,7 @@ async fn terminal_relative_links_resolve_unscanned_remote_files(
         metadata_calls + 1,
         "normalized candidates must use only one metadata request"
     );
-    let located = visual_cx
-        .update(|_, cx| {
-            workspace::path_link::resolve_open_target(
-                &workspace.downgrade(),
-                workspace::path_link::PathMatching::Heuristic,
-                "generated/later.rs:2:3",
-                None,
-                cx,
-            )
-        })
+    let located = resolve("generated/later.rs:2:3", PathMatching::Heuristic)
         .await
         .unwrap();
     assert_eq!(located.path().path, resolved.path().path);
@@ -5974,18 +5959,12 @@ async fn terminal_relative_links_resolve_unscanned_remote_files(
         )
         .await;
         let metadata_calls = fs.metadata_call_count();
-        let escaped = visual_cx
-            .update(|_, cx| {
-                workspace::path_link::resolve_open_target(
-                    &workspace.downgrade(),
-                    workspace::path_link::PathMatching::Heuristic,
-                    r"data/crawler\_switch\_eligible\_results.md",
-                    None,
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
+        let escaped = resolve(
+            r"data/crawler\_switch\_eligible\_results.md",
+            PathMatching::Heuristic,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             escaped.path().path,
             Path::new(path!("/project/data/crawler_switch_eligible_results.md"))
@@ -5995,32 +5974,20 @@ async fn terminal_relative_links_resolve_unscanned_remote_files(
             metadata_calls + 2,
             "check the literal path before the decoded path"
         );
-        let positioned = visual_cx
-            .update(|_, cx| {
-                workspace::path_link::resolve_open_target(
-                    &workspace.downgrade(),
-                    workspace::path_link::PathMatching::Heuristic,
-                    r"data/crawler\_switch\_eligible\_results.md:2:3",
-                    None,
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
+        let positioned = resolve(
+            r"data/crawler\_switch\_eligible\_results.md:2:3",
+            PathMatching::Heuristic,
+        )
+        .await
+        .unwrap();
         assert_eq!(positioned.path().path, escaped.path().path);
         assert_eq!(positioned.path().row, Some(2));
         assert_eq!(positioned.path().column, Some(3));
-        let exact = visual_cx
-            .update(|_, cx| {
-                workspace::path_link::resolve_open_target(
-                    &workspace.downgrade(),
-                    workspace::path_link::PathMatching::Exact,
-                    r"data/crawler\_switch\_eligible\_results.md",
-                    None,
-                    cx,
-                )
-            })
-            .await;
+        let exact = resolve(
+            r"data/crawler\_switch\_eligible\_results.md",
+            PathMatching::Exact,
+        )
+        .await;
         assert!(
             exact.is_none(),
             "document links must preserve their exact path"
@@ -6076,31 +6043,6 @@ async fn arcadia_remote_request_returns_url_without_touching_server_clipboard(
     drop(connect_guard);
     let ssh = RemoteClient::connect_mock(opts, cx).await;
     let project = build_project(ssh, cx);
-    for current_branch in [false, true] {
-        let url = project
-            .update(cx, |project, cx| {
-                project.get_arcadia_link(
-                    ProjectPath {
-                        worktree_id: worktree::WorktreeId::from_proto(1),
-                        path: rel_path("src/lib.rs").into(),
-                    },
-                    2,
-                    5,
-                    current_branch,
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-        assert!(url.ends_with("#L3-6"));
-        assert!(url.contains(if current_branch {
-            "rev=users%2Ftest%2Ffeature"
-        } else {
-            "rev=trunk"
-        }));
-    }
-    assert_eq!(calls.load(Ordering::Relaxed), 2);
-
     let worktree = project.update(cx, |project, cx| {
         project.add_test_remote_worktree("/arcadia", cx)
     });
@@ -6122,6 +6064,9 @@ async fn arcadia_remote_request_returns_url_without_touching_server_clipboard(
     let window = cx.add_window(|window, cx| Editor::for_buffer(buffer, Some(project), window, cx));
     let editor = window.root(cx).unwrap();
     let cx = &mut gpui::VisualTestContext::from_window(*window, cx);
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("unchanged".to_owned()))
+    });
     editor.update_in(cx, |editor, window, cx| {
         editor.change_selections(SelectionEffects::default(), window, cx, |s| {
             s.select_ranges([Point::new(2, 0)..Point::new(6, 0)]);
@@ -6129,9 +6074,17 @@ async fn arcadia_remote_request_returns_url_without_touching_server_clipboard(
         editor.open_context_menu(&editor::actions::OpenContextMenu, window, cx);
     });
     cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("unchanged")
+        )
+    });
     assert_eq!(
         calls.load(Ordering::Relaxed),
-        2,
+        0,
         "opening the menu must not request an Arcadia link"
     );
     assert!(
@@ -6168,7 +6121,7 @@ async fn arcadia_remote_request_returns_url_without_touching_server_clipboard(
             );
         });
     }
-    assert_eq!(calls.load(Ordering::Relaxed), 4);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
     server_cx.update(|cx| {
         assert_eq!(
             cx.read_from_clipboard().and_then(|item| item.text()),

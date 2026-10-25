@@ -211,30 +211,9 @@ mod tests {
             build_arcadia_link(&root.join("file.rs"), root, "trunk", 0, 0).unwrap(),
             "https://a.yandex-team.ru/arcadia/file.rs?rev=trunk#L1"
         );
-    }
-
-    #[test]
-    fn rejects_files_outside_root_and_invalid_ranges() {
-        assert!(
-            build_arcadia_link(
-                Path::new("/arcadia-other/file"),
-                Path::new("/arcadia"),
-                "trunk",
-                0,
-                0
-            )
-            .is_err()
-        );
-        assert!(
-            build_arcadia_link(
-                Path::new("/arcadia/file"),
-                Path::new("/arcadia"),
-                "trunk",
-                2,
-                1
-            )
-            .is_err()
-        );
+        for (file, start, end) in [("/arcadia-other/file", 0, 0), ("/arcadia/file", 2, 1)] {
+            assert!(build_arcadia_link(Path::new(file), root, "trunk", start, end).is_err());
+        }
     }
 
     #[cfg(unix)]
