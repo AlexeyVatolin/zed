@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub enum TerminalAgent {
     Claude,
     Codex,
+    Herdr,
 }
 
 impl TerminalAgent {
@@ -13,6 +14,7 @@ impl TerminalAgent {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Herdr => "herdr",
         }
     }
 }
@@ -30,10 +32,10 @@ impl TerminalAgentSession {
             Some(session_id) => format!(
                 "{} {} {}",
                 self.agent.program(),
-                if self.agent == TerminalAgent::Claude {
-                    "--resume"
-                } else {
-                    "resume"
+                match self.agent {
+                    TerminalAgent::Claude => "--resume",
+                    TerminalAgent::Codex => "resume",
+                    TerminalAgent::Herdr => "--session",
                 },
                 match shlex::try_quote(session_id) {
                     Ok(session_id) => session_id,
@@ -117,7 +119,9 @@ mod unix {
                     let Some(session) = &mut self.session else {
                         return false;
                     };
-                    if session.session_id.as_ref() == Some(&session_id) {
+                    if session.agent == TerminalAgent::Herdr
+                        || session.session_id.as_ref() == Some(&session_id)
+                    {
                         return false;
                     }
                     session.session_id = Some(session_id);
@@ -149,7 +153,11 @@ mod unix {
             let listener = std::os::unix::net::UnixListener::bind(directory.path().join("events"))?;
             let mut script = String::new();
             let mut fish_script = String::new();
-            for agent in [TerminalAgent::Claude, TerminalAgent::Codex] {
+            for agent in [
+                TerminalAgent::Claude,
+                TerminalAgent::Codex,
+                TerminalAgent::Herdr,
+            ] {
                 let program = agent.program();
                 script.push_str(&format!(r#"
 if [ -n "${{ZSH_VERSION-}}" ]; then
@@ -273,20 +281,45 @@ fi
         let agent = match arguments.remove(0).to_str() {
             Some("claude") => TerminalAgent::Claude,
             Some("codex") => TerminalAgent::Codex,
+            Some("herdr") => TerminalAgent::Herdr,
             _ => bail!("unsupported terminal agent"),
         };
         if arguments.first().is_some_and(|argument| argument == "--") {
             arguments.remove(0);
         }
         let executable = which::which(agent.program())
+            .or_else(|error| {
+                if agent == TerminalAgent::Herdr {
+                    let directory = std::env::var_os("HERDR_INSTALL_DIR")
+                        .map(PathBuf::from)
+                        .or_else(|| dirs::home_dir().map(|home| home.join(".local/bin")));
+                    if let Some(path) = directory
+                        .map(|directory| directory.join("herdr"))
+                        .filter(|path| path.is_file())
+                    {
+                        return Ok(path);
+                    }
+                }
+                Err(error)
+            })
             .with_context(|| format!("{} is not installed", agent.program()))?;
+        let herdr_session = if agent == TerminalAgent::Herdr {
+            let inherited = std::env::var("HERDR_SESSION").ok();
+            let socket_override = std::env::var_os("HERDR_SOCKET_PATH").is_some();
+            match herdr_session_name(&arguments, inherited.as_deref(), socket_override) {
+                Some(name) => Some(name),
+                None => return Err(Command::new(executable).args(arguments).exec().into()),
+            }
+        } else {
+            None
+        };
         if let Err(error) = install_hook(agent) {
             eprintln!("Zed could not install the session hook: {error:#}");
         }
         let launch = uuid::Uuid::new_v4().to_string();
         let session = TerminalAgentSession {
             agent,
-            session_id: explicit_session_id(agent, &arguments),
+            session_id: herdr_session.or_else(|| explicit_session_id(agent, &arguments)),
             working_directory: std::env::current_dir()?,
         };
         if let Err(error) = report(Event::Started {
@@ -306,6 +339,20 @@ fi
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        if agent == TerminalAgent::Herdr {
+            // Persistent panes must not inherit this terminal's lifecycle channel.
+            for variable in [
+                SOCKET,
+                HELPER,
+                OWNER,
+                LAUNCH,
+                AGENT,
+                "ZED_TERMINAL_AGENT_SCRIPT",
+                "ZED_TERMINAL_AGENT_SHELL",
+            ] {
+                command.env_remove(variable);
+            }
+        }
         // The CLI and its parent share the terminal foreground process group.
         // Only the CLI should handle Ctrl-C, while the parent records its exit.
         unsafe {
@@ -326,6 +373,46 @@ fi
             .code()
             .or_else(|| status.signal().map(|signal| 128 + signal))
             .unwrap_or(1))
+    }
+
+    fn herdr_session_name(
+        arguments: &[std::ffi::OsString],
+        inherited: Option<&str>,
+        socket_override: bool,
+    ) -> Option<String> {
+        let arguments = arguments
+            .iter()
+            .map(|argument| argument.to_str())
+            .collect::<Option<Vec<_>>>()?;
+        let mut arguments = arguments.as_slice();
+        let mut name = None;
+        if let ["session", "attach", session] = arguments {
+            name = Some(*session);
+            arguments = &[];
+        }
+        while let Some((argument, rest)) = arguments.split_first() {
+            arguments = rest;
+            if *argument == "--session" {
+                let (session, rest) = arguments.split_first()?;
+                name = Some(*session);
+                arguments = rest;
+            } else if let Some(session) = argument.strip_prefix("--session=") {
+                name = Some(session);
+            } else if *argument != "--handoff" {
+                return None;
+            }
+        }
+        if name.is_none() && socket_override {
+            return None;
+        }
+        let name = name.or(inherited).unwrap_or("default");
+        (!matches!(name, "help" | "--help" | "-h" | "." | "..")
+            && !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)))
+        .then(|| name.to_owned())
     }
 
     fn explicit_session_id(
@@ -433,6 +520,9 @@ fi
     }
 
     fn install_hook(agent: TerminalAgent) -> Result<()> {
+        if agent == TerminalAgent::Herdr {
+            return Ok(());
+        }
         let home = dirs::home_dir().context("no home directory")?;
         let directory = match agent {
             TerminalAgent::Claude => std::env::var_os("CLAUDE_CONFIG_DIR")
@@ -441,6 +531,7 @@ fi
             TerminalAgent::Codex => std::env::var_os("CODEX_HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".codex")),
+            TerminalAgent::Herdr => return Ok(()),
         };
         install_hook_in(&directory, agent)
     }
@@ -519,6 +610,72 @@ fi
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn herdr_tracking_selects_only_local_interactive_sessions() {
+            let parse = |arguments: &[&str], inherited, socket_override| {
+                let arguments = arguments
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>();
+                herdr_session_name(&arguments, inherited, socket_override)
+            };
+            for (arguments, expected) in [
+                (vec![], "default"),
+                (vec!["--session", "project-1"], "project-1"),
+                (vec!["--session=project-1"], "project-1"),
+                (vec!["session", "attach", "project-1"], "project-1"),
+                (vec!["--session", "first", "--session=last"], "last"),
+            ] {
+                assert_eq!(parse(&arguments, None, false).as_deref(), Some(expected));
+            }
+            assert_eq!(
+                parse(&[], Some("inherited"), false).as_deref(),
+                Some("inherited")
+            );
+            assert_eq!(parse(&[], Some("inherited"), true), None);
+            assert_eq!(
+                parse(&["--session=explicit"], Some("inherited"), true).as_deref(),
+                Some("explicit")
+            );
+            for arguments in [
+                vec!["session", "list"],
+                vec!["status"],
+                vec!["api", "snapshot"],
+                vec!["--help"],
+                vec!["--version"],
+                vec!["--remote", "vm"],
+                vec!["--session"],
+                vec!["--session=../other"],
+                vec!["session", "attach", "--help"],
+                vec!["session", "attach", "first", "extra"],
+            ] {
+                assert_eq!(parse(&arguments, None, false), None, "{arguments:?}");
+            }
+        }
+
+        #[test]
+        fn herdr_ignores_native_agent_hooks_and_tracks_detach() {
+            let mut state = SessionState::default();
+            let session = TerminalAgentSession {
+                agent: TerminalAgent::Herdr,
+                session_id: Some("existing-session".into()),
+                working_directory: "/project".into(),
+            };
+            assert!(state.apply(Event::Started {
+                launch: "attach".into(),
+                session: session.clone()
+            }));
+            assert!(!state.apply(Event::Session {
+                launch: "attach".into(),
+                session_id: uuid::Uuid::new_v4().to_string()
+            }));
+            assert_eq!(state.session, Some(session));
+            assert!(state.apply(Event::Exited {
+                launch: "attach".into()
+            }));
+            assert!(state.session.is_none());
+        }
+
         #[test]
         fn hook_installation_preserves_settings_and_is_idempotent() {
             for agent in [TerminalAgent::Claude, TerminalAgent::Codex] {
@@ -654,6 +811,7 @@ mod tests {
         for (agent, flag) in [
             (TerminalAgent::Claude, "--resume"),
             (TerminalAgent::Codex, "resume"),
+            (TerminalAgent::Herdr, "--session"),
         ] {
             let mut session = TerminalAgentSession {
                 agent,

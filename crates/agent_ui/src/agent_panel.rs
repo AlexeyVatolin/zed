@@ -984,6 +984,7 @@ struct AgentTerminal {
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
+    herdr_poll_task: Option<Task<()>>,
 }
 
 impl AgentTerminal {
@@ -1484,7 +1485,7 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -1527,17 +1528,21 @@ impl AgentPanel {
         });
 
         let connection_store = cx.new(|cx| AgentConnectionStore::new(project.clone(), cx));
-        let _project_subscription =
-            cx.subscribe(&project, |this, _project, event, cx| match event {
+        let _project_subscription = cx.subscribe_in(
+            &project,
+            window,
+            |this, _project, event, window, cx| match event {
                 project::Event::TerminalAgentSessionUpdated {
                     terminal_thread_id,
                     session,
                 } => {
-                    if let Ok(terminal_id) = TerminalId::from_key_string(terminal_thread_id)
-                        && let Some(terminal) = this.terminals.get_mut(&terminal_id)
-                    {
-                        terminal.agent_session = session.clone();
-                        this.persist_terminal_metadata(terminal_id, cx);
+                    if let Ok(terminal_id) = TerminalId::from_key_string(terminal_thread_id) {
+                        this.update_terminal_agent_session(
+                            terminal_id,
+                            session.clone(),
+                            window,
+                            cx,
+                        );
                     }
                 }
                 project::Event::WorktreeAdded(_)
@@ -1550,7 +1555,8 @@ impl AgentPanel {
                     cx.notify();
                 }
                 _ => {}
-            });
+            },
+        );
 
         let _thread_metadata_store_subscription = cx.subscribe(
             &ThreadMetadataStore::global(cx),
@@ -2399,15 +2405,7 @@ impl AgentPanel {
                     .map(|session| session.resume_command())
             })
             .or_else(|| Self::terminal_init_command(run_init_command, cx));
-        let terminal_task = self.create_terminal_shell(
-            working_directory,
-            if herdr_session.is_none() {
-                Some(terminal_id)
-            } else {
-                None
-            },
-            cx,
-        );
+        let terminal_task = self.create_terminal_shell(working_directory, Some(terminal_id), cx);
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
         let project = self.project.downgrade();
@@ -2491,72 +2489,131 @@ impl AgentPanel {
         })
     }
 
+    fn update_terminal_agent_session(
+        &mut self,
+        terminal_id: TerminalId,
+        session: Option<util::terminal_agent::TerminalAgentSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use util::terminal_agent::TerminalAgent;
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        let name = session
+            .as_ref()
+            .filter(|session| session.agent == TerminalAgent::Herdr)
+            .and_then(|session| session.session_id.as_ref());
+        if let Some(name) = name {
+            if terminal
+                .herdr_session
+                .as_ref()
+                .is_none_or(|session| session.name != *name)
+            {
+                terminal.herdr_poll_task = None;
+                terminal.herdr_session = Some(HerdrTerminalSession {
+                    name: name.clone(),
+                    agent: None,
+                    agent_session: None,
+                    current_title: None,
+                    is_working: false,
+                    initial_command: None,
+                    initial_command_sent: true,
+                });
+            }
+        } else if terminal
+            .agent_session
+            .as_ref()
+            .is_some_and(|session| session.agent == TerminalAgent::Herdr)
+        {
+            terminal.herdr_session = None;
+            terminal.herdr_poll_task = None;
+        }
+        terminal.agent_session = session;
+        terminal.refresh_metadata(cx);
+        let start_polling = terminal.herdr_session.is_some() && terminal.herdr_poll_task.is_none();
+        self.persist_terminal_metadata(terminal_id, cx);
+        if start_polling {
+            self.poll_herdr_session(terminal_id, window, cx);
+        }
+        cx.emit(AgentPanelEvent::EntryChanged);
+        cx.notify();
+    }
+
     fn poll_herdr_session(
-        &self,
+        &mut self,
         terminal_id: TerminalId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(3)).await;
-                let command = match this.update(cx, |this, cx| {
-                    this.terminals
-                        .get(&terminal_id)
-                        .and_then(|terminal| terminal.herdr_session.as_ref())
-                        .map(|session| {
-                            herdr_terminal_thread::command(
-                                this.project.clone(),
-                                &["api".to_owned(), "snapshot".to_owned()],
-                                Some(&session.name),
-                                cx,
-                            )
-                        })
-                }) {
-                    Ok(Some(command)) => command.await?,
-                    Ok(None) | Err(_) => return anyhow::Ok(()),
-                };
-                let snapshot = cx
-                    .background_spawn(async move { herdr_terminal_thread::run(command) })
-                    .await;
-                let snapshot = match snapshot {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        log::debug!("Herdr session snapshot unavailable: {error:#}");
-                        continue;
-                    }
-                };
-                let launch = this.update_in(cx, |this, window, cx| {
-                    this.update_herdr_session_from_snapshot(terminal_id, &snapshot, window, cx)
-                })?;
-                if let Some((session_name, pane_id, initial_command)) = launch {
-                    let command = this
-                        .update(cx, |this, cx| {
-                            herdr_terminal_thread::command(
-                                this.project.clone(),
-                                &[
-                                    "pane".to_owned(),
-                                    "run".to_owned(),
-                                    pane_id,
-                                    initial_command,
-                                ],
-                                Some(&session_name),
-                                cx,
-                            )
-                        })?
-                        .await?;
-                    if let Err(error) = cx
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let result = async {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(3)).await;
+                    let command = match this.update(cx, |this, cx| {
+                        this.terminals
+                            .get(&terminal_id)
+                            .and_then(|terminal| terminal.herdr_session.as_ref())
+                            .map(|session| {
+                                herdr_terminal_thread::command(
+                                    this.project.clone(),
+                                    &["api".to_owned(), "snapshot".to_owned()],
+                                    Some(&session.name),
+                                    cx,
+                                )
+                            })
+                    }) {
+                        Ok(Some(command)) => command.await?,
+                        Ok(None) | Err(_) => return anyhow::Ok(()),
+                    };
+                    let snapshot = cx
                         .background_spawn(async move { herdr_terminal_thread::run(command) })
-                        .await
-                    {
-                        log::error!("failed to start agent in Herdr terminal: {error:#}");
-                        let workspace = this.read_with(cx, |this, _cx| this.workspace.clone())?;
-                        workspace.update(cx, |workspace, cx| workspace.show_error(error, cx))?;
+                        .await;
+                    let snapshot = match snapshot {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            log::debug!("Herdr session snapshot unavailable: {error:#}");
+                            continue;
+                        }
+                    };
+                    let launch = this.update_in(cx, |this, window, cx| {
+                        this.update_herdr_session_from_snapshot(terminal_id, &snapshot, window, cx)
+                    })?;
+                    if let Some((session_name, pane_id, initial_command)) = launch {
+                        let command = this
+                            .update(cx, |this, cx| {
+                                herdr_terminal_thread::command(
+                                    this.project.clone(),
+                                    &[
+                                        "pane".to_owned(),
+                                        "run".to_owned(),
+                                        pane_id,
+                                        initial_command,
+                                    ],
+                                    Some(&session_name),
+                                    cx,
+                                )
+                            })?
+                            .await?;
+                        if let Err(error) = cx
+                            .background_spawn(async move { herdr_terminal_thread::run(command) })
+                            .await
+                        {
+                            log::error!("failed to start agent in Herdr terminal: {error:#}");
+                            let workspace =
+                                this.read_with(cx, |this, _cx| this.workspace.clone())?;
+                            workspace
+                                .update(cx, |workspace, cx| workspace.show_error(error, cx))?;
+                        }
                     }
                 }
             }
-        })
-        .detach_and_log_err(cx);
+            .await;
+            result.log_err();
+        });
+        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+            terminal.herdr_poll_task = Some(task);
+        }
     }
 
     fn update_herdr_session_from_snapshot(
@@ -2769,13 +2826,18 @@ impl AgentPanel {
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
             _subscriptions: vec![view_subscription, terminal_subscription],
+            herdr_poll_task: None,
         };
         if self.pending_terminal_spawn == Some(terminal_id) {
             self.pending_terminal_spawn = None;
         }
         terminal.refresh_metadata(cx);
         terminal.report_started_terminal_program(terminal_id, source, cx);
+        let tracked_session = terminal.agent_session.clone();
         self.terminals.insert(terminal_id, terminal);
+        if tracked_session.is_some() {
+            self.update_terminal_agent_session(terminal_id, tracked_session, window, cx);
+        }
         self.persist_terminal_metadata(terminal_id, cx);
         self.emit_terminal_thread_started(terminal_id, source, cx);
         if select {
@@ -8459,6 +8521,69 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_running_herdr_adopts_the_existing_terminal(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| crate::terminal_thread_metadata_store::init(cx));
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel
+                    .insert_test_terminal("Shell", true, window, cx)
+                    .unwrap()
+            })
+            .unwrap();
+        let session = util::terminal_agent::TerminalAgentSession {
+            agent: util::terminal_agent::TerminalAgent::Herdr,
+            session_id: Some("already-running".into()),
+            working_directory: "/project".into(),
+        };
+        panel.update(&mut cx, |panel, cx| {
+            panel.project.update(cx, |_, cx| {
+                cx.emit(project::Event::TerminalAgentSessionUpdated {
+                    terminal_thread_id: terminal_id.to_key_string(),
+                    session: Some(session.clone()),
+                })
+            });
+        });
+        cx.run_until_parked();
+        let terminal = panel.read_with(&cx, |panel, cx| {
+            let terminal = &panel.terminals[&terminal_id];
+            assert_eq!(
+                terminal.herdr_session.as_ref().unwrap().name,
+                "already-running"
+            );
+            assert!(terminal.herdr_poll_task.is_some());
+            let metadata = panel.terminal_metadata(terminal_id, cx).unwrap();
+            assert_eq!(metadata.icon(), IconName::Herdr);
+            assert_eq!(metadata.agent_session.as_ref(), Some(&session));
+            terminal.view.read(cx).terminal().clone()
+        });
+        assert!(
+            terminal
+                .update(&mut cx, |terminal, _| terminal.take_input_log())
+                .is_empty()
+        );
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.request_close_terminal_from_terminal_event(terminal_id, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx).read(cx);
+            assert_eq!(
+                store
+                    .entry(terminal_id)
+                    .unwrap()
+                    .herdr_session
+                    .as_ref()
+                    .unwrap()
+                    .name,
+                "already-running"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_terminal_agent_session_restore_and_exit(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         cx.update(|_, cx| {
@@ -8474,6 +8599,14 @@ mod tests {
                 Some(uuid::Uuid::new_v4().to_string()),
             ),
             (util::terminal_agent::TerminalAgent::Codex, None),
+            (
+                util::terminal_agent::TerminalAgent::Herdr,
+                Some("existing-session".into()),
+            ),
+            (
+                util::terminal_agent::TerminalAgent::Herdr,
+                Some("default".into()),
+            ),
         ] {
             let session = util::terminal_agent::TerminalAgentSession {
                 agent,
@@ -8523,6 +8656,17 @@ mod tests {
                     Some(&session.working_directory)
                 )
             });
+            panel.read_with(&cx, |panel, cx| {
+                let metadata = panel.terminal_metadata(terminal_id, cx).unwrap();
+                assert_eq!(
+                    metadata.herdr_session.is_some(),
+                    agent == util::terminal_agent::TerminalAgent::Herdr
+                );
+                if let Some(session) = metadata.herdr_session {
+                    assert!(session.initial_command_sent);
+                    assert!(session.initial_command.is_none());
+                }
+            });
             panel.update(&mut cx, |panel, cx| {
                 panel.project.update(cx, |_, cx| {
                     cx.emit(project::Event::TerminalAgentSessionUpdated {
@@ -8532,13 +8676,12 @@ mod tests {
                 })
             });
             cx.run_until_parked();
-            assert!(panel.read_with(&cx, |panel, cx| {
-                panel
-                    .terminal_metadata(terminal_id, cx)
-                    .unwrap()
-                    .agent_session
-                    .is_none()
-            }));
+            panel.read_with(&cx, |panel, cx| {
+                let metadata = panel.terminal_metadata(terminal_id, cx).unwrap();
+                assert!(metadata.agent_session.is_none());
+                assert!(metadata.herdr_session.is_none());
+                assert!(panel.terminals[&terminal_id].herdr_poll_task.is_none());
+            });
         }
     }
 
