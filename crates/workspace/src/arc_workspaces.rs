@@ -561,7 +561,7 @@ printf 'git version arc2git-zed\n'
                 .envs(env.iter().copied())
                 .output()?)
         }
-        fn create(&self) -> Result<()> {
+        fn create(&self) -> Result<Output> {
             let output = self.run(
                 CREATE_SCRIPT,
                 &["sample", "~/arcadia-worktrees", "custom/project"],
@@ -572,7 +572,7 @@ printf 'git version arc2git-zed\n'
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            Ok(())
+            Ok(output)
         }
         fn delete(&self, env: &[(&str, &str)]) -> Result<Output> {
             self.run(
@@ -588,34 +588,9 @@ printf 'git version arc2git-zed\n'
     }
 
     #[test]
-    fn mounts_configured_path_and_reuses_existing_arc_mount() -> Result<()> {
+    fn initializes_git_before_returning_paths_and_reuses_existing_mount() -> Result<()> {
         let fixture = ArcFixture::new()?;
-        fixture.create()?;
-        assert!(fixture.mount().join(".git/.arc2git-zed").is_file());
-        assert!(!fixture.mount().join("custom/project/.git").exists());
-        fixture.create()?;
-        assert!(!fixture.mount().join("custom/project/.git").exists());
-        let commands = std::fs::read_to_string(fixture.home.join("commands"))?;
-        assert_eq!(
-            commands
-                .lines()
-                .filter(|command| command.starts_with("mount "))
-                .count(),
-            1
-        );
-        assert!(fixture.store().join("data").exists());
-        Ok(())
-    }
-
-    #[test]
-    fn initializes_git_before_returning_project_paths() -> Result<()> {
-        let fixture = ArcFixture::new()?;
-        let output = fixture.run(
-            CREATE_SCRIPT,
-            &["sample", "~/arcadia-worktrees", "custom/project"],
-            &[],
-        )?;
-        assert!(output.status.success());
+        let output = fixture.create()?;
         assert_eq!(
             String::from_utf8(output.stdout)?,
             format!(
@@ -624,13 +599,28 @@ printf 'git version arc2git-zed\n'
                 fixture.mount().join("custom/project").display()
             )
         );
-        assert!(fixture.mount().join(".git/.arc2git-zed").is_file());
         assert_eq!(
             std::fs::read_to_string(fixture.home.join("git-commands"))?,
             format!(
                 "-C {} --version\n",
                 fixture.mount().join("custom/project").display()
             )
+        );
+        for reopen in [false, true] {
+            if reopen {
+                fixture.create()?;
+            }
+            assert!(fixture.mount().join(".git/.arc2git-zed").is_file());
+            assert!(!fixture.mount().join("custom/project/.git").exists());
+            assert!(fixture.store().join("data").exists());
+        }
+        let commands = std::fs::read_to_string(fixture.home.join("commands"))?;
+        assert_eq!(
+            commands
+                .lines()
+                .filter(|command| command.starts_with("mount "))
+                .count(),
+            1
         );
         Ok(())
     }
@@ -651,58 +641,45 @@ printf 'git version arc2git-zed\n'
     }
 
     #[test]
-    fn removes_mount_and_store_but_preserves_neighbour() -> Result<()> {
-        let fixture = ArcFixture::new()?;
-        fixture.create()?;
-        let neighbour = fixture.home.join("arcadia-worktrees/neighbour");
-        std::fs::create_dir(&neighbour)?;
-        std::fs::write(neighbour.join("keep"), "keep")?;
-        let output = fixture.delete(&[])?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(!fixture.mount().exists());
-        assert!(!fixture.store().exists());
-        assert!(neighbour.join("keep").exists());
-        assert!(!std::fs::read_to_string(fixture.home.join("commands"))?.contains("--force"));
-        assert!(fixture.delete(&[])?.status.success());
-        Ok(())
-    }
-
-    #[test]
-    fn falls_back_to_force_only_after_unmount_failure() -> Result<()> {
-        let fixture = ArcFixture::new()?;
-        fixture.create()?;
-        let output = fixture.delete(&[("NORMAL_FAIL", "1")])?;
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(!fixture.mount().exists());
-        assert!(!fixture.store().exists());
-        let commands = std::fs::read_to_string(fixture.home.join("commands"))?;
-        let unmounts: Vec<_> = commands
-            .lines()
-            .filter(|command| command.starts_with("unmount "))
-            .collect();
-        assert_eq!(unmounts.len(), 2);
-        assert!(!unmounts[0].contains("--force"));
-        assert!(unmounts[1].contains("--force"));
-        Ok(())
-    }
-
-    #[test]
-    fn failed_forced_unmount_preserves_mount_and_store() -> Result<()> {
-        let fixture = ArcFixture::new()?;
-        fixture.create()?;
-        let output = fixture.delete(&[("NORMAL_FAIL", "1"), ("FORCE_FAIL", "1")])?;
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("forced unmount failed"));
-        assert!(fixture.mount().join(".arcadia.root").exists());
-        assert!(fixture.store().join("data").exists());
+    fn deletion_retries_unmount_and_preserves_data_on_failure() -> Result<()> {
+        for (environment, succeeds, unmount_count) in [
+            (vec![], true, 1),
+            (vec![("NORMAL_FAIL", "1")], true, 2),
+            (vec![("NORMAL_FAIL", "1"), ("FORCE_FAIL", "1")], false, 2),
+        ] {
+            let fixture = ArcFixture::new()?;
+            fixture.create()?;
+            let neighbour = fixture.home.join("arcadia-worktrees/neighbour");
+            std::fs::create_dir(&neighbour)?;
+            std::fs::write(neighbour.join("keep"), "keep")?;
+            let output = fixture.delete(&environment)?;
+            assert_eq!(
+                output.status.success(),
+                succeeds,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(neighbour.join("keep").exists());
+            let commands = std::fs::read_to_string(fixture.home.join("commands"))?;
+            let unmounts: Vec<_> = commands
+                .lines()
+                .filter(|command| command.starts_with("unmount "))
+                .collect();
+            assert_eq!(unmounts.len(), unmount_count);
+            assert!(!unmounts[0].contains("--force"));
+            if unmount_count == 2 {
+                assert!(unmounts[1].contains("--force"));
+            }
+            if succeeds {
+                assert!(!fixture.mount().exists());
+                assert!(!fixture.store().exists());
+                assert!(fixture.delete(&[])?.status.success());
+            } else {
+                assert!(String::from_utf8_lossy(&output.stderr).contains("forced unmount failed"));
+                assert!(fixture.mount().join(".arcadia.root").exists());
+                assert!(fixture.store().join("data").exists());
+            }
+        }
         Ok(())
     }
 

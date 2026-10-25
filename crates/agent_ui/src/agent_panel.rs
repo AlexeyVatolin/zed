@@ -1812,11 +1812,13 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         if self.should_create_terminal_for_new_entry(cx) {
-            if AgentSettings::get_global(cx).terminal_herdr_enabled {
-                self.new_herdr_terminal(workspace, AgentThreadSource::AgentPanel, window, cx);
-            } else {
-                self.new_terminal(workspace, AgentThreadSource::AgentPanel, window, cx);
-            }
+            self.new_terminal_with_herdr(
+                workspace,
+                AgentSettings::get_global(cx).terminal_herdr_enabled,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
         } else {
             self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
         }
@@ -2029,26 +2031,23 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.supports_terminal(cx) {
-            return;
-        }
-        self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Terminal, cx);
-        let working_directory = self.terminal_working_directory(workspace, cx);
-        self.spawn_new_terminal(
-            TerminalId::new(),
-            working_directory,
-            false,
-            true,
-            true,
-            source,
-            window,
-            cx,
-        );
+        self.new_terminal_with_herdr(workspace, false, source, window, cx);
     }
 
     pub fn new_herdr_terminal(
         &mut self,
         workspace: Option<&Workspace>,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_terminal_with_herdr(workspace, true, source, window, cx);
+    }
+
+    fn new_terminal_with_herdr(
+        &mut self,
+        workspace: Option<&Workspace>,
+        use_herdr: bool,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2061,8 +2060,7 @@ impl AgentPanel {
         self.spawn_new_terminal(
             TerminalId::new(),
             working_directory,
-            true,
-            true,
+            use_herdr,
             true,
             source,
             window,
@@ -2075,7 +2073,6 @@ impl AgentPanel {
         terminal_id: TerminalId,
         working_directory: Option<PathBuf>,
         use_herdr: bool,
-        select: bool,
         focus: bool,
         source: AgentThreadSource,
         window: &mut Window,
@@ -2089,7 +2086,7 @@ impl AgentPanel {
                 None,
                 None,
                 None,
-                select,
+                true,
                 focus,
                 false,
                 source,
@@ -2254,12 +2251,8 @@ impl AgentPanel {
                                     working_directory: Some(working_directory.clone()),
                                     herdr_session: Some(HerdrTerminalSession {
                                         name: name.clone(),
-                                        agent: None,
-                                        agent_session: None,
-                                        current_title: None,
-                                        is_working: false,
                                         initial_command,
-                                        initial_command_sent: false,
+                                        ..Default::default()
                                     }),
                                     agent_session: None,
                                 },
@@ -2272,7 +2265,7 @@ impl AgentPanel {
                             None,
                             Some(name.into()),
                             None,
-                            select,
+                            true,
                             focus,
                             false,
                             source,
@@ -2364,6 +2357,14 @@ impl AgentPanel {
         .detach();
     }
 
+    fn saved_terminal_metadata(
+        terminal_id: TerminalId,
+        cx: &App,
+    ) -> Option<TerminalThreadMetadata> {
+        TerminalThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry(terminal_id).cloned())
+    }
+
     fn spawn_terminal(
         &mut self,
         terminal_id: TerminalId,
@@ -2384,27 +2385,18 @@ impl AgentPanel {
         // as empty and spawning a second, "initial" terminal on activation.
         self.pending_terminal_spawn = Some(terminal_id);
         let terminal_working_directory = working_directory.clone();
-        let herdr_session = TerminalThreadMetadataStore::try_global(cx).and_then(|store| {
-            store
-                .read(cx)
-                .entry(terminal_id)
-                .and_then(|metadata| metadata.herdr_session.clone())
-        });
-        let agent_session = TerminalThreadMetadataStore::try_global(cx).and_then(|store| {
-            store
-                .read(cx)
-                .entry(terminal_id)
-                .and_then(|metadata| metadata.agent_session.clone())
-        });
-        let init_command = herdr_session
+        let metadata = Self::saved_terminal_metadata(terminal_id, cx);
+        let herdr_session = metadata
             .as_ref()
+            .and_then(|metadata| metadata.herdr_session.as_ref());
+        let agent_session = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.agent_session.as_ref());
+        let init_command = herdr_session
             .map(|session| session.attach_command(self.project.read(cx).path_style(cx)))
-            .or_else(|| {
-                agent_session
-                    .as_ref()
-                    .map(|session| session.resume_command())
-            })
+            .or_else(|| agent_session.map(|session| session.resume_command()))
             .or_else(|| Self::terminal_init_command(run_init_command, cx));
+        let is_herdr = herdr_session.is_some();
         let terminal_task = self.create_terminal_shell(working_directory, Some(terminal_id), cx);
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
@@ -2450,7 +2442,7 @@ impl AgentPanel {
                     cx,
                 );
                 Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
-                if herdr_session.is_some() {
+                if is_herdr {
                     this.poll_herdr_session(terminal_id, window, cx);
                 }
             })?;
@@ -2513,12 +2505,8 @@ impl AgentPanel {
                 terminal.herdr_poll_task = None;
                 terminal.herdr_session = Some(HerdrTerminalSession {
                     name: name.clone(),
-                    agent: None,
-                    agent_session: None,
-                    current_title: None,
-                    is_working: false,
-                    initial_command: None,
                     initial_command_sent: true,
+                    ..Default::default()
                 });
             }
         } else if terminal
@@ -2792,6 +2780,7 @@ impl AgentPanel {
         let last_known_terminal_title = initial_title
             .map(|title| title.to_string())
             .unwrap_or_default();
+        let metadata = Self::saved_terminal_metadata(terminal_id, cx);
         let mut terminal = AgentTerminal {
             view: terminal_view,
             title_editor: None,
@@ -2800,25 +2789,15 @@ impl AgentPanel {
             last_known_title: last_known_terminal_title.clone(),
             last_known_terminal_title,
             last_observed_program: None,
-            herdr_session: TerminalThreadMetadataStore::try_global(cx).and_then(|store| {
-                store
-                    .read(cx)
-                    .entry(terminal_id)
-                    .and_then(|metadata| metadata.herdr_session.clone())
-            }),
+            herdr_session: metadata
+                .as_ref()
+                .and_then(|metadata| metadata.herdr_session.clone()),
             agent_session: self
                 .project
                 .read(cx)
                 .terminal_agent_session(&terminal_id.to_key_string())
                 .cloned()
-                .or_else(|| {
-                    TerminalThreadMetadataStore::try_global(cx).and_then(|store| {
-                        store
-                            .read(cx)
-                            .entry(terminal_id)
-                            .and_then(|metadata| metadata.agent_session.clone())
-                    })
-                }),
+                .or_else(|| metadata.and_then(|metadata| metadata.agent_session)),
             working_directory,
             created_at: created_at.unwrap_or_else(Utc::now),
             has_notification: false,
@@ -5826,7 +5805,6 @@ impl AgentPanel {
             terminal_id,
             working_directory,
             AgentSettings::get_global(cx).terminal_herdr_enabled,
-            true,
             false,
             source,
             window,
@@ -12050,12 +12028,7 @@ mod tests {
                 .unwrap()
                 .herdr_session = Some(HerdrTerminalSession {
                 name: "project".to_owned(),
-                agent: None,
-                agent_session: None,
-                current_title: None,
-                is_working: false,
-                initial_command: None,
-                initial_command_sent: false,
+                ..Default::default()
             });
             panel.update_herdr_session_from_snapshot(
                 herdr_terminal_id,

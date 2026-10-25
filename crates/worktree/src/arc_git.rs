@@ -64,6 +64,17 @@ fn expand_executable(executable: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+async fn validated_executable(fs: &dyn Fs, configured: &str) -> Result<PathBuf> {
+    let executable = expand_executable(configured)?;
+    let metadata = fs.metadata(&executable).await?;
+    ensure!(
+        metadata.is_some_and(|metadata| !metadata.is_dir && metadata.is_executable),
+        "Arc Git adapter is not executable: {}. Check git.arc_executable in user/server settings",
+        executable.display()
+    );
+    Ok(executable)
+}
+
 pub async fn executable_for_directory(
     fs: &dyn Fs,
     directory: &Path,
@@ -75,23 +86,17 @@ pub async fn executable_for_directory(
     if find_root(fs, directory).await?.is_none() {
         return Ok(None);
     }
-    let executable = expand_executable(configured)?;
-    let metadata = fs.metadata(&executable).await?;
-    ensure!(
-        metadata.is_some_and(|metadata| !metadata.is_dir && metadata.is_executable),
-        "Arc Git adapter is not executable: {}. Check git.arc_executable in user/server settings",
-        executable.display()
-    );
-    Ok(Some(executable))
+    Ok(Some(validated_executable(fs, configured).await?))
 }
 
 pub async fn initialize(fs: &dyn Fs, directory: &Path, configured: Option<&str>) -> Result<()> {
-    let Some(executable) = executable_for_directory(fs, directory, configured).await? else {
+    let Some(configured) = configured else {
         return Ok(());
     };
-    let root = find_root(fs, directory)
-        .await?
-        .context("Arc repository disappeared before initialization")?;
+    let Some(root) = find_root(fs, directory).await? else {
+        return Ok(());
+    };
+    let executable = validated_executable(fs, configured).await?;
     // Ancestor discovery runs before GitStore exists. Bootstrap here so that
     // the first scan can see the adapter's lazily-created repository metadata.
     let output = new_command(&executable)

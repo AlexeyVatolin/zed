@@ -82,11 +82,8 @@ impl TerminalThreadMetadata {
     }
 
     pub fn editable_title(&self) -> SharedString {
-        if let Some(session) = &self.herdr_session {
-            return self
-                .custom_title
-                .clone()
-                .unwrap_or_else(|| session.display_title().to_owned().into());
+        if self.herdr_session.is_some() {
+            return self.display_title();
         }
         self.custom_title.clone().unwrap_or_else(|| {
             SharedString::from(terminal_title_without_prefix(self.title.as_ref()).to_string())
@@ -758,84 +755,76 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_agent_session_identity_round_trips_in_database(cx: &mut TestAppContext) {
-        cx.update(init);
+    async fn test_terminal_sessions_round_trip_and_clear_in_database(cx: &mut TestAppContext) {
+        use util::terminal_agent::{TerminalAgent, TerminalAgentSession};
+
+        init_test(cx);
         let database = cx.update(|cx| TerminalThreadMetadataStore::global(cx).read(cx).db.clone());
-        for (agent, session_id) in [
-            (
-                util::terminal_agent::TerminalAgent::Claude,
-                Some(uuid::Uuid::new_v4().to_string()),
-            ),
-            (
-                util::terminal_agent::TerminalAgent::Codex,
-                Some(uuid::Uuid::new_v4().to_string()),
-            ),
-            (util::terminal_agent::TerminalAgent::Codex, None),
-        ] {
-            let mut metadata = metadata("Agent", WorktreePaths::default());
-            metadata.agent_session = Some(util::terminal_agent::TerminalAgentSession {
-                agent,
-                session_id,
-                working_directory: "/remote/project".into(),
-            });
-            database.save(metadata.clone()).await.unwrap();
-            let restored = database
+        let read_metadata = |terminal_id| {
+            database
                 .list()
                 .unwrap()
                 .into_iter()
-                .find(|entry| entry.terminal_id == metadata.terminal_id)
-                .unwrap();
-            assert_eq!(restored.agent_session, metadata.agent_session);
-            assert_eq!(restored.icon(), IconName::Terminal);
-            metadata.agent_session = None;
+                .find(|entry| entry.terminal_id == terminal_id)
+                .unwrap()
+        };
+        for (agent, session_id) in [
+            (
+                TerminalAgent::Claude,
+                Some(uuid::Uuid::new_v4().to_string()),
+            ),
+            (TerminalAgent::Codex, Some(uuid::Uuid::new_v4().to_string())),
+            (TerminalAgent::Codex, None),
+            (TerminalAgent::Herdr, None),
+        ] {
+            let mut metadata = metadata("Agent", WorktreePaths::default());
+            metadata.agent_session =
+                (agent != TerminalAgent::Herdr).then(|| TerminalAgentSession {
+                    agent,
+                    session_id,
+                    working_directory: "/remote/project".into(),
+                });
+            if agent == TerminalAgent::Herdr {
+                metadata.herdr_session = Some(HerdrTerminalSession {
+                    name: "workspace-2".into(),
+                    agent: Some("codex".into()),
+                    agent_session: Some(HerdrAgentSession {
+                        source: "herdr:codex".into(),
+                        agent: "codex".into(),
+                        kind: "id".into(),
+                        value: "session-after-switch".into(),
+                    }),
+                    current_title: Some("Investigate failing tests".into()),
+                    is_working: true,
+                    initial_command: Some("codex".into()),
+                    initial_command_sent: true,
+                });
+            }
             database.save(metadata.clone()).await.unwrap();
-            assert!(
-                database
-                    .list()
-                    .unwrap()
-                    .into_iter()
-                    .find(|entry| entry.terminal_id == metadata.terminal_id)
-                    .unwrap()
-                    .agent_session
-                    .is_none()
+            let restored = read_metadata(metadata.terminal_id);
+            assert_eq!(restored, metadata);
+            assert_eq!(
+                restored.icon(),
+                if agent == TerminalAgent::Herdr {
+                    IconName::Herdr
+                } else {
+                    IconName::Terminal
+                }
             );
+            assert_eq!(
+                restored.display_title().as_ref(),
+                if agent == TerminalAgent::Herdr {
+                    "Investigate failing tests"
+                } else {
+                    "Agent"
+                }
+            );
+            metadata.agent_session = None;
+            metadata.herdr_session = None;
+            database.save(metadata.clone()).await.unwrap();
+            let restored = read_metadata(metadata.terminal_id);
+            assert_eq!(restored, metadata);
         }
-    }
-
-    #[gpui::test]
-    async fn test_herdr_session_identity_round_trips_in_database(cx: &mut TestAppContext) {
-        init_test(cx);
-        let mut metadata = metadata(
-            "workspace",
-            WorktreePaths::from_folder_paths(&PathList::default()),
-        );
-        metadata.herdr_session = Some(HerdrTerminalSession {
-            name: "workspace-2".to_owned(),
-            agent: Some("codex".to_owned()),
-            agent_session: Some(HerdrAgentSession {
-                source: "herdr:codex".to_owned(),
-                agent: "codex".to_owned(),
-                kind: "id".to_owned(),
-                value: "session-after-switch".to_owned(),
-            }),
-            current_title: Some("Investigate failing tests".to_owned()),
-            is_working: true,
-            initial_command: Some("codex".to_owned()),
-            initial_command_sent: true,
-        });
-        let database = cx.update(|cx| TerminalThreadMetadataStore::global(cx).read(cx).db.clone());
-        database
-            .save(metadata.clone())
-            .await
-            .expect("save Herdr metadata");
-        let restored = database.list().expect("load Herdr metadata");
-        assert_eq!(restored.len(), 1);
-        assert_eq!(restored[0].herdr_session, metadata.herdr_session);
-        assert_eq!(
-            restored[0].display_title().as_ref(),
-            "Investigate failing tests"
-        );
-        assert_eq!(restored[0].icon(), IconName::Herdr);
     }
 
     #[gpui::test]
