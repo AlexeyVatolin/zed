@@ -197,7 +197,7 @@ pub struct ReleaseAsset {
 }
 
 fn release_asset_from_github(
-    release: http_client::github::GithubRelease,
+    release: github_releases::GithubRelease,
     asset: &str,
     os: &str,
     arch: &str,
@@ -732,15 +732,14 @@ impl AutoUpdater {
 
         if release_channel == ReleaseChannel::Nightly {
             let release = if let Some(version) = version {
-                http_client::github::get_release_by_tag_name(
+                github_releases::get_release_by_tag_name(
                     FORK_RELEASE_REPOSITORY,
                     &format!("v{version}"),
                     http_client,
                 )
                 .await?
             } else {
-                http_client::github::get_latest_release(FORK_RELEASE_REPOSITORY, http_client)
-                    .await?
+                github_releases::get_latest_release(FORK_RELEASE_REPOSITORY, http_client).await?
             };
             return release_asset_from_github(release, asset, os, arch);
         }

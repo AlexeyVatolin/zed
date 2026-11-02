@@ -2998,7 +2998,7 @@ impl AgentPanel {
             custom_title: terminal.custom_title(cx),
             created_at: terminal.created_at,
             worktree_paths: project.worktree_paths(cx),
-            remote_connection: project.remote_connection_options(cx),
+            remote_connection: project.remote_connection_options(cx).cloned(),
             working_directory: terminal.working_directory.clone(),
             herdr_session: terminal.herdr_session.clone(),
             agent_session: terminal.agent_session.clone(),

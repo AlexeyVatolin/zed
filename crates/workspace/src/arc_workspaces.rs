@@ -3,9 +3,7 @@ use std::{collections::HashSet, path::Path, sync::Arc};
 use anyhow::{Context as _, Result, ensure};
 use gpui::{App, Global, PromptLevel, Task, Window};
 use parking_lot::Mutex;
-use remote::{
-    Interactive, RemoteConnection, RemoteConnectionOptions, same_remote_connection_identity,
-};
+use remote::{Interactive, RemoteConnection, RemoteConnectionOptions};
 use settings::{
     ArcWorkspace, ArcWorkspacesConfig, RegisterSetting, RemoteProject, Settings, SshConnection,
     update_settings_file_with_completion,
@@ -32,7 +30,7 @@ pub fn ssh_connection(options: &RemoteConnectionOptions, cx: &App) -> Option<Ssh
         .iter()
         .find(|connection| {
             let candidate = RemoteConnectionOptions::Ssh((*connection).clone().into());
-            same_remote_connection_identity(Some(options), Some(&candidate))
+            options.identity() == candidate.identity()
         })
         .cloned()
 }
@@ -325,7 +323,7 @@ pub fn begin_deletion(
     let pending = cx.global::<PendingDeletes>().0.clone();
     let key = format!(
         "{}:{}",
-        remote::remote_connection_identity(options).persistence_key(),
+        options.host_key(),
         workspace.mount_path
     );
     ensure!(
@@ -355,7 +353,7 @@ pub fn remove_open_folder(
         project.update(cx, |project, cx| project.remove_worktree(worktree_id, cx));
         return Task::ready(Ok(true));
     };
-    let options = client.read(cx).connection_options();
+    let options = client.read(cx).connection_options().clone();
     let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
         return Task::ready(Ok(false));
     };
@@ -397,7 +395,7 @@ pub async fn finish_deletion(
                 if let Some(connections) = settings.remote.ssh_connections.as_mut() {
                     for connection in connections {
                         let candidate = RemoteConnectionOptions::Ssh(connection.clone().into());
-                        if same_remote_connection_identity(Some(&options), Some(&candidate)) {
+                        if options.identity() == candidate.identity() {
                             connection.projects.retain(|project| {
                                 !project
                                     .paths
@@ -422,10 +420,7 @@ pub async fn finish_deletion(
                             let Some(client) = project.read(cx).remote_client() else {
                                 continue;
                             };
-                            if !same_remote_connection_identity(
-                                Some(&options),
-                                Some(&client.read(cx).connection_options()),
-                            ) {
+                            if options.identity() != client.read(cx).connection_options().identity() {
                                 continue;
                             }
                             let ids: Vec<_> = project
@@ -449,7 +444,7 @@ pub async fn finish_deletion(
     let db = cx.update(|cx| WorkspaceDb::global(cx));
     for recent in db.recent_project_workspaces_ungrouped(fs.as_ref()).await? {
         if let SerializedWorkspaceLocation::Remote(connection) = &recent.location {
-            if same_remote_connection_identity(Some(&options), Some(connection))
+            if options.identity() == connection.identity()
                 && recent
                     .paths
                     .paths()
