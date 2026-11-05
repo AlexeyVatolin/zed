@@ -66,8 +66,8 @@ pub fn managed_workspace_for_group(
     if paths.len() != 1 {
         return None;
     }
-    let workspace = managed_workspace(&options, paths.first()?, cx)?;
-    Some((options, workspace))
+    let workspace = managed_workspace(options, paths.first()?, cx)?;
+    Some((options.clone(), workspace))
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
