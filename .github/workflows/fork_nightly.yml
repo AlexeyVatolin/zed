@@ -200,6 +200,8 @@ jobs:
         run: |
           ./script/linux
           ./script/download-wasi-sdk
+      - name: Check application
+        run: cargo check --locked -p zed
       - name: Test updater
         run: cargo test -p auto_update
       - name: Test file finder
