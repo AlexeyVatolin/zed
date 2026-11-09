@@ -2741,7 +2741,7 @@ impl Sidebar {
                             .project()
                             .read(cx)
                             .remote_client()
-                            .map(|client| client.read(cx).connection_options());
+                            .map(|client| client.read(cx).connection_options().clone());
                         if let Some(options) = options.filter(|options| {
                             workspace::arc_workspaces::config_for_connection(options, cx).is_some()
                         }) {
