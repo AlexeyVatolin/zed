@@ -3558,6 +3558,80 @@ async fn test_agent_panel_terminal_notifications_update_sidebar(cx: &mut TestApp
 }
 
 #[gpui::test]
+async fn test_terminal_manual_unread_survives_refresh_until_sidebar_activation(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let first = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("First", true, window, cx)
+        })
+        .expect("first terminal");
+    let second = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Second", true, window, cx)
+        })
+        .expect("second terminal");
+    cx.run_until_parked();
+
+    // Cover the active terminal, an inactive terminal, then the same active terminal again.
+    for terminal_id in [second, first, first] {
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.mark_terminal_unread(terminal_id, cx)
+        });
+        cx.run_until_parked();
+        sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _cx| {
+            assert!(sidebar.contents.notified_terminals.contains(&terminal_id));
+            assert!(sidebar.contents.entries.iter().any(|entry| {
+                matches!(entry, ListEntry::Terminal(terminal) if terminal.metadata.terminal_id == terminal_id && terminal.has_notification)
+            }));
+        });
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                !panel
+                    .terminals(cx)
+                    .iter()
+                    .any(|terminal| terminal.has_notification)
+            );
+        });
+        sidebar
+            .update_in(cx, |sidebar, window, cx| {
+                let terminal = sidebar
+                    .contents
+                    .entries
+                    .iter()
+                    .find_map(|entry| match entry {
+                        ListEntry::Terminal(terminal)
+                            if terminal.metadata.terminal_id == terminal_id =>
+                        {
+                            Some(terminal.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("terminal row");
+                sidebar.activate_terminal_entry(
+                    terminal.metadata,
+                    terminal.workspace,
+                    false,
+                    window,
+                    cx,
+                );
+            })
+            .expect("activate terminal from sidebar");
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _cx| {
+            assert!(!sidebar.contents.notified_terminals.contains(&terminal_id));
+        });
+        panel.read_with(cx, |panel, _cx| {
+            assert_eq!(panel.active_terminal_id(), Some(terminal_id));
+        });
+    }
+}
+
+#[gpui::test]
 async fn test_thread_switcher_can_activate_agent_panel_terminal(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
