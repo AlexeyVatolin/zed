@@ -812,6 +812,8 @@ pub struct Sidebar {
     /// state because they do not have a live `agent::Thread` to report it.
     regenerating_titles: HashSet<ThreadId>,
     herdr_archiving: HashSet<TerminalId>,
+    /// Manual marks survive refreshes even while the terminal is visible.
+    manually_unread_terminals: HashSet<TerminalId>,
     /// Starting a rename must seed the current title into the title editor,
     /// so this prevents that BufferEdited event from being interpreted as user input.
     suppress_next_rename_edit: bool,
@@ -975,6 +977,7 @@ impl Sidebar {
             rename_target: None,
             regenerating_titles: HashSet::new(),
             herdr_archiving: HashSet::new(),
+            manually_unread_terminals: HashSet::new(),
             suppress_next_rename_edit: false,
 
             thread_last_accessed: HashMap::new(),
@@ -1464,7 +1467,7 @@ impl Sidebar {
         };
 
         let groups = mw.project_groups(cx);
-        let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        let mut live_notified_terminal_ids = self.manually_unread_terminals.clone();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
                 live_notified_terminal_ids.extend(
@@ -4633,6 +4636,12 @@ impl Sidebar {
         }
     }
 
+    fn mark_terminal_unread(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        self.manually_unread_terminals.insert(terminal_id);
+        self.update_entries(cx);
+        cx.notify();
+    }
+
     fn activate_terminal_entry(
         &mut self,
         metadata: TerminalThreadMetadata,
@@ -4641,6 +4650,10 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.manually_unread_terminals.remove(&metadata.terminal_id) {
+            self.update_entries(cx);
+            cx.notify();
+        }
         match workspace {
             ThreadEntryWorkspace::Open(workspace) => {
                 self.activate_terminal_in_workspace(&workspace, metadata, retain, window, cx);
@@ -5265,6 +5278,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         let terminal_id = metadata.terminal_id;
+        self.manually_unread_terminals.remove(&terminal_id);
         let is_active = self
             .active_entry
             .as_ref()
@@ -6906,7 +6920,13 @@ impl Sidebar {
                 let sidebar = sidebar.clone();
                 let rename_title = rename_title.clone();
                 ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                    menu.entry("Rename Title", None, move |window, cx| {
+                    let unread_sidebar = sidebar.clone();
+                    menu.entry("Mark as Unread", None, move |_window, cx| {
+                        unread_sidebar
+                            .update(cx, |sidebar, cx| sidebar.mark_terminal_unread(terminal_id, cx))
+                            .log_err();
+                    })
+                    .entry("Rename Title", None, move |window, cx| {
                         sidebar
                             .update(cx, |sidebar, cx| {
                                 sidebar.start_renaming_entry(
