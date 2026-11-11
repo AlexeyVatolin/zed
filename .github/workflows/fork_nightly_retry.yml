@@ -1,0 +1,77 @@
+name: Retry Zed macOS runner acquisition
+
+on:
+  workflow_run:
+    workflows: [Zed Custom releases]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  retry:
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.run_attempt == 1 &&
+      (github.event.workflow_run.conclusion == 'cancelled' ||
+      github.event.workflow_run.conclusion == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    concurrency:
+      group: zed-macos-retry-${{ github.event.workflow_run.id }}
+      cancel-in-progress: false
+    permissions:
+      actions: write
+      checks: read
+    steps:
+      - name: Retry macOS if GitHub did not assign a runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          repository="repos/$GITHUB_REPOSITORY"
+          jobs=$(gh api "$repository/actions/runs/$RUN_ID/attempts/1/jobs?per_page=100")
+          if ! jq -e '
+            any(.jobs[]; .name == "prepare" and .conclusion == "success") and
+            any(.jobs[]; .name == "linux" and .conclusion == "success")
+          ' <<< "$jobs" >/dev/null; then
+            echo 'Preparation or Linux did not succeed; no automatic retry.'
+            exit 0
+          fi
+
+          job=$(jq -c '
+            [.jobs[] | select(.name == "macos" and
+              (.conclusion == "cancelled" or .conclusion == "failure") and
+              (.runner_id // 0) == 0 and (.runner_name // "") == "" and
+              (.steps | length) == 0)] |
+            if length == 1 then .[0] else empty end
+          ' <<< "$jobs")
+          if [[ -z "$job" ]]; then
+            echo 'No macOS job cancelled before runner assignment.'
+            exit 0
+          fi
+
+          job_id=$(jq -er '.id' <<< "$job")
+          check_id=$(jq -er '.check_run_url | split("/") | last' <<< "$job")
+          [[ "$job_id" =~ ^[0-9]+$ && "$check_id" =~ ^[0-9]+$ ]]
+          annotations=$(gh api --paginate --slurp "$repository/check-runs/$check_id/annotations?per_page=100")
+          if ! jq -e 'any(.[][]; .annotation_level == "failure" and
+            .message == "The job was not acquired by Runner of type hosted even after multiple attempts")' \
+            <<< "$annotations" >/dev/null; then
+            echo 'GitHub did not report a runner acquisition failure; no automatic retry.'
+            exit 0
+          fi
+
+          # The completion event can be stale if a newer build or manual retry has started.
+          latest=$(gh api "$repository/actions/workflows/fork_nightly.yml/runs?branch=main&per_page=1")
+          if ! jq -e --argjson run_id "$RUN_ID" '.workflow_runs[0] |
+            .id == $run_id and .status == "completed" and .run_attempt == 1 and
+            (.conclusion == "cancelled" or .conclusion == "failure")' \
+            <<< "$latest" >/dev/null; then
+            echo 'The build is no longer the latest completed first attempt; no automatic retry.'
+            exit 0
+          fi
+
+          gh api --method POST "$repository/actions/jobs/$job_id/rerun"
+          echo "Requested one retry of macOS job $job_id and its dependent publish job."
