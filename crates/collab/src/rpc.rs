@@ -2098,7 +2098,7 @@ async fn join_project(
             removed_repositories: Default::default(),
         };
         for update in proto::split_worktree_update(message) {
-            session.peer.send(session.connection_id, update.clone())?;
+            session.peer.send(session.connection_id, update)?;
         }
 
         // Stream this worktree's diagnostics.
@@ -3031,7 +3031,7 @@ async fn create_channel(
             channels: vec![channel.to_proto()],
             ..Default::default()
         };
-        session.peer.send(connection_id, update.clone())?;
+        session.peer.send(connection_id, update)?;
     }
 
     Ok(())
@@ -3307,7 +3307,7 @@ async fn move_channel(
             ..Default::default()
         };
 
-        session.peer.send(connection_id, update.clone())?;
+        session.peer.send(connection_id, update)?;
     }
 
     response.send(Ack {})?;
@@ -3351,7 +3351,7 @@ async fn reorder_channel(
                 ..Default::default()
             };
 
-            session.peer.send(connection_id, update.clone())?;
+            session.peer.send(connection_id, update)?;
         }
     }
 
