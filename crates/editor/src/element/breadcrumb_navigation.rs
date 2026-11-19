@@ -1,4 +1,5 @@
 use std::{
+    ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -255,7 +256,7 @@ impl DirectoryPopover {
                 }
                 .await;
                 if let Err(error) = result {
-                    workspace.update(cx, |workspace, cx| workspace.show_error(error, cx))?;
+                    workspace.update(cx, |workspace, cx| workspace.show_error(error, cx));
                 }
                 anyhow::Ok(())
             })
@@ -338,7 +339,7 @@ impl Render for DirectoryPopover {
                 Some(Ok(_)) => uniform_list(
                     "breadcrumb-directory-entries",
                     entry_count,
-                    cx.processor(|this, range, _, cx| {
+                    cx.processor(|this, range: Range<usize>, _, cx| {
                         let view = cx.entity().downgrade();
                         range
                             .filter_map(|index| {
