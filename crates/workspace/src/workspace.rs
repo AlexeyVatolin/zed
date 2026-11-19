@@ -1921,17 +1921,7 @@ impl Workspace {
                 }
 
                 project::Event::LanguageServerPrompt(request) => {
-                    struct LanguageServerPrompt;
-
-                    this.show_notification(
-                        NotificationId::composite::<LanguageServerPrompt>(request.id),
-                        cx,
-                        |cx| {
-                            cx.new(|cx| {
-                                notifications::LanguageServerPrompt::new(request.clone(), cx)
-                            })
-                        },
-                    );
+                    return this.show_language_server_prompt(request, cx);
                 }
 
                 project::Event::AgentLocationChanged => {
