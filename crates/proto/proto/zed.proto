@@ -518,11 +518,22 @@ message Envelope {
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
     GetTerminalShellResponse get_terminal_shell_response = 495;
-    GetArcadiaLink get_arcadia_link = 496;
-    GetArcadiaLinkResponse get_arcadia_link_response = 497;
-    RefreshGitRepository refresh_git_repository = 498;
-    TerminalAgentSessionUpdated terminal_agent_session_updated = 499;
-    CloseTerminalAgentIntegration close_terminal_agent_integration = 500; // current max
+    GetGlobalSkills get_global_skills = 496;
+    GetGlobalSkillsResponse get_global_skills_response = 497;
+    GlobalSkillsChanged global_skills_changed = 498;
+    CreateGlobalSkill create_global_skill = 499;
+    CreateGlobalSkillResponse create_global_skill_response = 500;
+    TrashGlobalSkill trash_global_skill = 501;
+    ResolveGlobalSkillPath resolve_global_skill_path = 502;
+    ResolveGlobalSkillPathResponse resolve_global_skill_path_response = 503;
+    ApplyGlobalSkillFileOperation apply_global_skill_file_operation = 504; // current max
+
+    // Fork messages use a separate range to avoid upstream field number collisions.
+    GetArcadiaLink get_arcadia_link = 60000;
+    GetArcadiaLinkResponse get_arcadia_link_response = 60001;
+    RefreshGitRepository refresh_git_repository = 60002;
+    TerminalAgentSessionUpdated terminal_agent_session_updated = 60003;
+    CloseTerminalAgentIntegration close_terminal_agent_integration = 60004;
   }
 
   reserved 87 to 88;

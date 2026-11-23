@@ -1,3 +1,4 @@
+use crate::global_skills::GlobalSkills;
 use anyhow::{Context as _, Result, anyhow};
 use client::ProjectId;
 use collections::HashMap;
@@ -77,6 +78,7 @@ pub struct HeadlessProject {
     pub _toolchain_store: Entity<ToolchainStore>,
     pub kernels: HashMap<String, Child>,
     terminal_agent_integrations: HashMap<String, Task<()>>,
+    _global_skills: Entity<GlobalSkills>,
     search_buffer_batches: async_channel::Sender<SearchBufferBatch>,
     _search_buffer_sender: Task<()>,
 }
@@ -294,6 +296,8 @@ impl HeadlessProject {
             cx,
         );
 
+        let global_skills = cx.new(|cx| GlobalSkills::new(fs.clone(), session.clone(), cx));
+
         // local_machine -> ssh handlers
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &worktree_store);
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &buffer_store);
@@ -435,6 +439,7 @@ impl HeadlessProject {
             _toolchain_store: toolchain_store,
             kernels: Default::default(),
             terminal_agent_integrations: Default::default(),
+            _global_skills: global_skills,
             search_buffer_batches,
             _search_buffer_sender: search_buffer_sender,
         }

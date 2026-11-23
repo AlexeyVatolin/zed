@@ -442,11 +442,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "collections",
  "const_format",
  "fs",
  "futures 0.3.34",
  "gpui",
  "paths",
+ "proto",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -4108,6 +4110,7 @@ dependencies = [
  "futures 0.3.34",
  "http_client",
  "itertools 0.14.0",
+ "log",
  "parking_lot",
  "semver",
  "serde",
@@ -5491,7 +5494,6 @@ dependencies = [
  "tree-sitter-go",
  "tree-sitter-html",
  "tree-sitter-md",
- "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
@@ -7105,6 +7107,7 @@ dependencies = [
  "ui_input",
  "unicode-width 0.2.2",
  "unindent",
+ "url",
  "util",
  "watch",
  "workspace",
@@ -7336,6 +7339,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -9582,7 +9586,6 @@ dependencies = [
  "language_model_core",
  "log",
  "parking_lot",
- "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -9830,7 +9833,6 @@ dependencies = [
  "tree-sitter-c",
  "tree-sitter-cpp",
  "tree-sitter-css",
- "tree-sitter-gitcommit",
  "tree-sitter-go",
  "tree-sitter-python",
  "tree-sitter-rust",
@@ -12230,6 +12232,7 @@ dependencies = [
 name = "open_path_prompt"
 version = "0.1.0"
 dependencies = [
+ "clock",
  "editor",
  "file_icons",
  "futures 0.3.34",
@@ -12238,6 +12241,7 @@ dependencies = [
  "menu",
  "picker",
  "project",
+ "rpc",
  "serde",
  "serde_json",
  "settings",
@@ -15119,6 +15123,7 @@ dependencies = [
  "agent",
  "agent-client-protocol",
  "agent_servers",
+ "agent_skills",
  "anyhow",
  "askpass",
  "async-channel 2.5.0",
@@ -16557,7 +16562,6 @@ dependencies = [
  "search",
  "serde",
  "serde_json",
- "serde_yaml_ng",
  "settings",
  "shell_command_parser",
  "strum 0.28.0",
@@ -17973,11 +17977,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
- "futures 0.3.34",
  "gpui",
  "hex",
  "log",
- "parking_lot",
  "pretty_assertions",
  "proto",
  "schemars 1.0.4",
@@ -22315,12 +22317,14 @@ dependencies = [
  "cargo_toml",
  "clap",
  "compliance",
+ "crates_io_client",
  "gh-workflow",
  "guppy",
  "indexmap 2.14.2",
  "indoc",
  "itertools 0.14.0",
  "regex",
+ "reqwest_client",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -22330,6 +22334,7 @@ dependencies = [
  "tokio",
  "toml 0.9.8",
  "toml_edit 0.22.27",
+ "tracing-subscriber",
  "url",
 ]
 
