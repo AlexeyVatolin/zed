@@ -204,6 +204,10 @@ jobs:
           ./script/download-wasi-sdk
       - name: Check application
         run: cargo check --locked -p zed
+      - name: Test animations
+        run: cargo test --locked -p gpui --lib elements::animation::tests
+      - name: Test spinners
+        run: cargo test --locked -p ui --lib spinner_label::tests
       - name: Test updater
         run: cargo test -p auto_update
       - name: Test file finder
