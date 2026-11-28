@@ -170,10 +170,10 @@ jobs:
           app="$mount/Zed Custom.app"
           test -d "$app"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = 'io.github.alexeyvatolin.ZedCustom'
-          lipo -verify_arch arm64 "$app/Contents/MacOS/zed"
+          lipo "$app/Contents/MacOS/zed" -verify_arch arm64
           codesign --verify --deep --strict "$app"
           gzip -dc target/zed-remote-server-macos-aarch64.gz > "$RUNNER_TEMP/zed-remote-server-macos"
-          lipo -verify_arch arm64 "$RUNNER_TEMP/zed-remote-server-macos"
+          lipo "$RUNNER_TEMP/zed-remote-server-macos" -verify_arch arm64
       - name: Stage macOS assets
         run: |
           mkdir -p release-assets
